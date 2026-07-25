@@ -1,0 +1,33 @@
+# ─── Python ───────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# ─── Virtual environments ─────────────────────
+.venv/
+venv/
+env/
+.env
+!.env.example
+
+# ─── Playwright ───────────────────────────────
+playwright/.auth/
+
+# ─── IDE & OS ─────────────────────────────────
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ─── Logs ─────────────────────────────────────
+*.log
+logs/
+
+# ─── Docker ───────────────────────────────────
+*.tar

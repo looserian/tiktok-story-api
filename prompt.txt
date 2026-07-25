@@ -1,0 +1,121 @@
+You are a senior Python backend engineer.
+
+Build a production-ready REST API named "TikTok Story API".
+
+## Tech Stack
+
+- Python 3.12
+- FastAPI
+- Uvicorn
+- Playwright
+- Pydantic
+- Docker
+- Docker Compose
+
+## Requirements
+
+Create the following project structure:
+
+tiktok-story-api/
+│
+├── app/
+│   ├── main.py
+│   ├── routes.py
+│   ├── scraper.py
+│   ├── auth.py
+│   ├── config.py
+│   ├── models.py
+│   └── __init__.py
+│
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+├── .gitignore
+└── README.md
+
+----------------------------------
+
+Requirements:
+
+Use FastAPI.
+
+Create these endpoints:
+
+GET /
+
+returns
+
+{
+    "name":"TikTok Story API",
+    "version":"1.0"
+}
+
+GET /health
+
+returns
+
+{
+    "status":"ok"
+}
+
+GET /stories?username=
+
+For now DO NOT implement scraping.
+
+Return
+
+{
+    "success":true,
+    "username":"...",
+    "stories":[]
+}
+
+----------------------------------
+
+Authentication
+
+Use Bearer Token authentication.
+
+Read API_KEY from environment variables.
+
+Every endpoint except "/" and "/health" must require
+
+Authorization: Bearer YOUR_API_KEY
+
+Return HTTP 401 if invalid.
+
+----------------------------------
+
+Docker
+
+Create a Dockerfile that installs
+
+Python
+Playwright
+Chromium
+
+Install browser dependencies correctly.
+
+Create docker-compose.yml exposing port 8000.
+
+----------------------------------
+
+README
+
+Include instructions for
+
+docker compose up --build
+
+and
+
+http://localhost:8000/docs
+
+----------------------------------
+
+Code quality
+
+- Type hints
+- Comments where needed
+- Modular architecture
+- Ready for future scraper implementation
