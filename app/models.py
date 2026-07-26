@@ -40,6 +40,7 @@ class PageInfo(BaseModel):
     """Metadata returned by the Playwright page visit."""
     title: str | None
     url: str
+    html_length: int | None = None
 
 
 class StoriesPageResponse(BaseModel):

@@ -63,5 +63,6 @@ async def get_stories(
         page=PageInfo(
             title=result.get("title"),
             url=result["url"],
+            html_length=result.get("html_length"),
         ),
     )
