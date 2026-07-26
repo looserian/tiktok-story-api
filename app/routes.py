@@ -5,8 +5,8 @@ routes.py - API route definitions for the TikTok Story API.
 from fastapi import APIRouter, Depends, Query
 
 from app.auth import verify_api_key
-from app.models import HealthResponse, RootResponse, StoriesResponse
-from app.scraper import fetch_stories
+from app.models import HealthResponse, RootResponse, PageInfo, StoriesPageResponse
+from app.scraper import fetch_page_info
 from app.config import settings
 
 router = APIRouter()
@@ -36,22 +36,32 @@ async def health() -> HealthResponse:
 
 @router.get(
     "/stories",
-    response_model=StoriesResponse,
+    response_model=StoriesPageResponse,
     summary="Get TikTok stories",
     description=(
-        "Returns TikTok stories for the specified username. "
-        "Requires a valid Bearer token in the Authorization header. "
-        "Scraping is not yet implemented — always returns an empty list."
+        "Navigates to the TikTok profile page for the given username using a "
+        "headless Chromium browser and returns basic page metadata. "
+        "HTML story scraping is not yet implemented (Phase 3). "
+        "Requires a valid Bearer token in the Authorization header."
     ),
     dependencies=[Depends(verify_api_key)],  # 🔒 Protected
 )
 async def get_stories(
     username: str = Query(..., description="TikTok username to fetch stories for"),
-) -> StoriesResponse:
+) -> StoriesPageResponse:
     """
-    Protected endpoint — fetches stories for a given TikTok username.
+    Protected endpoint — launches a Playwright Chromium browser, navigates
+    to https://www.tiktok.com/@{username}, and returns the page title and
+    final URL.
 
-    Currently delegates to the scraper stub, which returns an empty list.
+    Story scraping will be added in Phase 3.
     """
-    stories = await fetch_stories(username)
-    return StoriesResponse(success=True, username=username, stories=stories)
+    result = await fetch_page_info(username)
+    return StoriesPageResponse(
+        success=result["success"],
+        username=username,
+        page=PageInfo(
+            title=result.get("title"),
+            url=result["url"],
+        ),
+    )

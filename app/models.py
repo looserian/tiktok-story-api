@@ -30,10 +30,23 @@ class Story(BaseModel):
 
 
 class StoriesResponse(BaseModel):
-    """Response model for the /stories endpoint."""
+    """Response model for the /stories endpoint (Phase 1 — kept for compatibility)."""
     success: bool
     username: str
     stories: list[Story]
+
+
+class PageInfo(BaseModel):
+    """Metadata returned by the Playwright page visit."""
+    title: str | None
+    url: str
+
+
+class StoriesPageResponse(BaseModel):
+    """Response model for the /stories endpoint (Phase 2)."""
+    success: bool
+    username: str
+    page: PageInfo
 
 
 class ErrorResponse(BaseModel):
