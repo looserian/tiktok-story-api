@@ -96,10 +96,13 @@ async def fetch_page_info(username: str) -> dict:
 
             try:
                 body = await response.json()
+                logger.info("Story API JSON received")
 
-            except Exception:
-
+            except Exception as e:
+                logger.warning(f"Couldn't parse JSON: {e}")
                 body = await response.text()
+            
+            SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
             story_path = SCREENSHOTS_DIR / "story_response.json"
 
