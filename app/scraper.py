@@ -89,6 +89,26 @@ async def fetch_page_info(username: str) -> dict:
     async def _on_response(response: Response) -> None:
         """Correlate response with stored request meta and filter by keyword."""
         url = response.url
+        # Only inspect the Story API
+        if "/api/story/item_list/" in url:
+
+            logger.info("Story API detected!")
+
+            try:
+                body = await response.json()
+
+            except Exception:
+
+                body = await response.text()
+
+            story_path = SCREENSHOTS_DIR / "story_response.json"
+
+            story_path.write_text(
+                json.dumps(body, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            logger.info("Saved Story API response")
         if not _is_api_url(url):
             return
         entry = {
