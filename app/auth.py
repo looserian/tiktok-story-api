@@ -1,30 +1,84 @@
 """
-auth.py - Bearer token authentication dependency for FastAPI.
+auth.py - API key authentication dependency for FastAPI.
+
+Accepts the key via EITHER:
+  • X-API-Key: <key>              (header — preferred for new clients)
+  • Authorization: Bearer <key>   (header — backwards-compatible with n8n / existing clients)
+
+Keys are validated against the comma-separated API_KEYS setting.
+On failure → HTTP 401 with a structured JSON body.
 """
 
-from fastapi import Depends, HTTPException, Security, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from __future__ import annotations
+
+import logging
+
+from fastapi import HTTPException, Request, status
+from fastapi.security.utils import get_authorization_scheme_param
 
 from app.config import settings
 
-# FastAPI security scheme — expects "Authorization: Bearer <token>"
-_bearer_scheme = HTTPBearer(auto_error=True)
+logger = logging.getLogger(__name__)
 
 
-def verify_api_key(
-    credentials: HTTPAuthorizationCredentials = Security(_bearer_scheme),
-) -> str:
+def _extract_key(request: Request) -> str | None:
     """
-    FastAPI dependency that validates the Bearer token against the
-    configured API_KEY environment variable.
+    Pull the API key from the request, trying both auth mechanisms.
 
-    Raises HTTP 401 if the token is missing or invalid.
-    Returns the validated token string on success.
+    Priority:
+      1. ``X-API-Key`` header
+      2. ``Authorization: Bearer <token>`` header
+
+    Returns the raw key string, or ``None`` if neither is present.
     """
-    if credentials.credentials != settings.api_key:
+    # 1. X-API-Key header (preferred)
+    x_api_key = request.headers.get("X-API-Key")
+    if x_api_key:
+        return x_api_key.strip()
+
+    # 2. Authorization: Bearer <token>
+    auth_header = request.headers.get("Authorization", "")
+    scheme, token = get_authorization_scheme_param(auth_header)
+    if scheme.lower() == "bearer" and token:
+        return token.strip()
+
+    return None
+
+
+async def verify_api_key(request: Request) -> str:
+    """
+    FastAPI dependency that validates the supplied API key.
+
+    Raises:
+        HTTPException 401: When the key is missing or not in API_KEYS.
+
+    Returns:
+        The validated key string (available downstream for logging).
+    """
+    key = _extract_key(request)
+
+    if key is None:
+        logger.warning("auth: missing API key  ip=%s", request.client.host if request.client else "unknown")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key.",
+            detail={
+                "success": False,
+                "error": "API key is missing. Supply it via X-API-Key header or Authorization: Bearer <key>.",
+            },
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return credentials.credentials
+
+    if key not in settings.get_key_set():
+        # Log only the last 4 chars to avoid leaking secrets.
+        masked = ("*" * max(0, len(key) - 4)) + key[-4:]
+        logger.warning("auth: invalid API key  key=%s  ip=%s", masked, request.client.host if request.client else "unknown")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "success": False,
+                "error": "Invalid API key.",
+            },
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return key
