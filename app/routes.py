@@ -2,12 +2,13 @@
 routes.py - API route definitions for the TikTok Story API.
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth import verify_api_key
-from app.models import HealthResponse, RootResponse, PageInfo, StoriesPageResponse, NetworkRequest
+from app.models import HealthResponse, RootResponse, ParsedStoriesResponse
 from app.scraper import fetch_page_info
 from app.config import settings
+from app.utils.parser import parse_story_response
 
 router = APIRouter()
 
@@ -36,44 +37,43 @@ async def health() -> HealthResponse:
 
 @router.get(
     "/stories",
-    response_model=StoriesPageResponse,
+    response_model=ParsedStoriesResponse,
     summary="Get TikTok stories",
     description=(
         "Navigates to the TikTok profile page for the given username using a "
-        "headless Chromium browser and returns basic page metadata alongside "
-        "intercepted API network requests. "
-        "Story scraping is not yet implemented. "
+        "headless Chromium browser, intercepts the Story API response, and "
+        "returns a cleaned, structured list of stories with account info. "
         "Requires a valid Bearer token in the Authorization header."
     ),
-    dependencies=[Depends(verify_api_key)],  # 🔒 Protected
+    dependencies=[Depends(verify_api_key)],  # Protected
 )
 async def get_stories(
     username: str = Query(..., description="TikTok username to fetch stories for"),
-) -> StoriesPageResponse:
+) -> ParsedStoriesResponse:
     """
     Protected endpoint — launches a Playwright Chromium browser, navigates
-    to https://www.tiktok.com/@{username}, intercepts network traffic, and
-    returns the page title, final URL, and filtered API network requests.
-
-    Story scraping will be added in a future phase.
+    to https://www.tiktok.com/@{username}, intercepts the Story API network
+    response, parses it, and returns a clean structured payload.
     """
     result = await fetch_page_info(username)
-    return StoriesPageResponse(
-        success=result["success"],
-        username=username,
-        page=PageInfo(
-            title=result.get("title"),
-            url=result["url"],
-            html_length=result.get("html_length"),
-        ),
-        network=[
-            NetworkRequest(
-                url=entry["url"],
-                method=entry["method"],
-                status=entry["status"],
-                resource_type=entry["resource_type"],
-            )
-            for entry in result.get("network", [])
-        ],
-    )
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=result.get("error", "Failed to fetch TikTok page"),
+        )
+
+    story_json: dict | None = result.get("story_json")
+
+    if story_json is None:
+        # TikTok did not fire the Story API during this session.
+        return ParsedStoriesResponse(
+            success=False,
+            username=username,
+            story_count=0,
+            stories=[],
+        )
+
+    parsed = parse_story_response(story_json)
+    return ParsedStoriesResponse(**parsed)
 

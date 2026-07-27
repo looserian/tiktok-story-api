@@ -62,3 +62,36 @@ class StoriesPageResponse(BaseModel):
 class ErrorResponse(BaseModel):
     """Generic error response model."""
     detail: str
+
+
+class ParsedStory(BaseModel):
+    """A single cleaned story item (image or video)."""
+
+    id: str | None = None
+    type: str | None = None          # "image" | "video"
+    created_at: int | None = None
+    expires_at: int | None = None
+    # Image stories
+    images: list[str] | None = None
+    # Video stories
+    video_url: str | None = None
+    download_url: str | None = None
+    cover: str | None = None
+    duration: int | None = None
+    views: int | None = None
+    likes: int | None = None
+
+
+class ParsedStoriesResponse(BaseModel):
+    """Cleaned response returned by the /stories endpoint."""
+
+    success: bool
+    username: str | None = None
+    nickname: str | None = None
+    avatar: str | None = None
+    followers: int | None = None
+    following: int | None = None
+    likes: int | None = None
+    videos: int | None = None
+    story_count: int = 0
+    stories: list[ParsedStory] = []

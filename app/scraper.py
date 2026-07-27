@@ -82,12 +82,16 @@ async def fetch_page_info(username: str) -> dict:
     # Final filtered list of captured network entries.
     network_log: list[dict] = []
 
+    # Raw JSON payload from TikTok's Story API (None until captured).
+    _story_json: dict | None = None
+
     def _on_request(request: Request) -> None:
         """Store resource type keyed by URL for later correlation."""
         _request_meta[request.url] = request.resource_type
 
     async def _on_response(response: Response) -> None:
         """Correlate response with stored request meta and filter by keyword."""
+        nonlocal _story_json
         url = response.url
         # Only inspect the Story API
         if "/api/story/item_list/" in url:
@@ -97,11 +101,13 @@ async def fetch_page_info(username: str) -> dict:
             try:
                 body = await response.json()
                 logger.info("Story API JSON received")
+                # Store for the caller so it can be parsed without re-reading disk.
+                _story_json = body
 
             except Exception as e:
                 logger.warning(f"Couldn't parse JSON: {e}")
                 body = await response.text()
-            
+
             SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
             story_path = SCREENSHOTS_DIR / "story_response.json"
@@ -205,6 +211,8 @@ async def fetch_page_info(username: str) -> dict:
                     "url": current_url,
                     "html_length": html_length,
                     "network": network_log,
+                    # Raw Story API payload — None if TikTok never fired the endpoint.
+                    "story_json": _story_json,
                 }
 
             finally:
