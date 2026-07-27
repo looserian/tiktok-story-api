@@ -1,17 +1,18 @@
 """
 scraper.py - TikTok page loader using async Playwright / Chromium.
 
-Phase 2: Browser navigation, page-info extraction, and debug artifacts.
-HTML story scraping will be added in a later phase.
+Phase 3: Network interception — records all API-related requests made while
+the TikTok profile page loads. Story scraping will be added in a later phase.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
-from playwright.async_api import async_playwright, Error as PlaywrightError
+from playwright.async_api import async_playwright, Error as PlaywrightError, Request, Response
 
 logger = logging.getLogger(__name__)
 
@@ -23,18 +24,29 @@ SCREENSHOTS_DIR = Path(__file__).resolve().parent.parent / "screenshots"
 # How long to wait after page load before capturing debug artifacts (seconds).
 DEBUG_SETTLE_SECONDS = 8
 
+# URL keywords that identify interesting API calls worth capturing.
+NETWORK_KEYWORDS = ("api", "story", "stories", "feed", "post", "item", "aweme")
+
+
+def _is_api_url(url: str) -> bool:
+    """Return True if *url* contains at least one of the tracked keywords."""
+    lower = url.lower()
+    return any(kw in lower for kw in NETWORK_KEYWORDS)
+
 
 async def fetch_page_info(username: str) -> dict:
     """
     Launch a headless Chromium browser, navigate to the TikTok profile page
-    for *username*, wait for the page to fully load, then capture debug
-    artifacts (screenshot + raw HTML) and return basic page metadata.
+    for *username*, intercept all network traffic, and return page metadata
+    together with a filtered list of API-related requests.
 
-    Debug artifacts are written to the ``screenshots/`` directory at the
-    project root:
+    Captured network data is also written to ``screenshots/network.json``.
 
-    - ``screenshots/debug.png``  — full-page screenshot
-    - ``screenshots/debug.html`` — raw page HTML
+    Debug artifacts written to ``screenshots/``:
+
+    - ``screenshots/debug.png``   — full-page screenshot
+    - ``screenshots/debug.html``  — raw page HTML
+    - ``screenshots/network.json``— filtered network requests (Phase 3)
 
     Args:
         username: TikTok username (without the leading ``@``).
@@ -46,7 +58,11 @@ async def fetch_page_info(username: str) -> dict:
                 "success": True,
                 "title":   "<page title>",
                 "url":     "<final url after any redirects>",
-                "html_length": <int>
+                "html_length": <int>,
+                "network": [
+                    {"url": "...", "method": "GET", "status": 200, "resource_type": "xhr"},
+                    ...
+                ]
             }
 
         On failure the dict will have ``"success": False`` and an
@@ -58,6 +74,36 @@ async def fetch_page_info(username: str) -> dict:
         username,
         target_url,
     )
+
+    # ── In-memory stores for intercepted traffic ─────────────────────────────
+    # Maps request URL → resource type (filled by the "request" event).
+    _request_meta: dict[str, str] = {}
+
+    # Final filtered list of captured network entries.
+    network_log: list[dict] = []
+
+    def _on_request(request: Request) -> None:
+        """Store resource type keyed by URL for later correlation."""
+        _request_meta[request.url] = request.resource_type
+
+    async def _on_response(response: Response) -> None:
+        """Correlate response with stored request meta and filter by keyword."""
+        url = response.url
+        if not _is_api_url(url):
+            return
+        entry = {
+            "url": url,
+            "method": response.request.method,
+            "status": response.status,
+            "resource_type": _request_meta.get(url, "unknown"),
+        }
+        network_log.append(entry)
+        logger.debug(
+            "fetch_page_info: captured  method=%s  status=%d  url=%s",
+            entry["method"],
+            entry["status"],
+            url,
+        )
 
     try:
         async with async_playwright() as pw:
@@ -75,36 +121,44 @@ async def fetch_page_info(username: str) -> dict:
                 )
                 page = await context.new_page()
 
-                # ── Navigate ────────────────────────────────────────────────
+                # ── Register network listeners BEFORE navigation ─────────────
+                page.on("request", _on_request)
+                page.on("response", _on_response)
+                logger.debug("fetch_page_info: network listeners registered")
+
+                # ── Navigate ─────────────────────────────────────────────────
                 logger.info("fetch_page_info: navigating to %s", target_url)
                 await page.goto(target_url, wait_until="load")
                 logger.info("fetch_page_info: page load event fired")
 
-                # ── Settle wait ─────────────────────────────────────────────
+                # ── Settle wait ──────────────────────────────────────────────
                 logger.info(
                     "fetch_page_info: waiting %d seconds for dynamic content to settle",
                     DEBUG_SETTLE_SECONDS,
                 )
                 await asyncio.sleep(DEBUG_SETTLE_SECONDS)
 
-                # ── Gather page info ────────────────────────────────────────
+                # ── Gather page info ─────────────────────────────────────────
                 title = await page.title()
                 current_url = page.url
                 html_content = await page.content()
                 html_length = len(html_content)
 
                 logger.info(
-                    "fetch_page_info: page ready  title=%r  url=%s  html_length=%d",
+                    "fetch_page_info: page ready  title=%r  url=%s  html_length=%d  "
+                    "network_entries=%d",
                     title,
                     current_url,
                     html_length,
+                    len(network_log),
                 )
 
-                # ── Save debug artifacts ────────────────────────────────────
+                # ── Save debug artifacts ─────────────────────────────────────
                 SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
                 screenshot_path = SCREENSHOTS_DIR / "debug.png"
                 html_path = SCREENSHOTS_DIR / "debug.html"
+                network_path = SCREENSHOTS_DIR / "network.json"
 
                 await page.screenshot(path=str(screenshot_path), full_page=True)
                 logger.info("fetch_page_info: screenshot saved → %s", screenshot_path)
@@ -112,11 +166,22 @@ async def fetch_page_info(username: str) -> dict:
                 html_path.write_text(html_content, encoding="utf-8")
                 logger.info("fetch_page_info: HTML saved → %s", html_path)
 
+                network_path.write_text(
+                    json.dumps(network_log, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "fetch_page_info: network log saved → %s  (%d entries)",
+                    network_path,
+                    len(network_log),
+                )
+
                 return {
                     "success": True,
                     "title": title,
                     "url": current_url,
                     "html_length": html_length,
+                    "network": network_log,
                 }
 
             finally:
@@ -135,6 +200,7 @@ async def fetch_page_info(username: str) -> dict:
             "title": None,
             "url": target_url,
             "html_length": 0,
+            "network": [],
             "error": str(exc),
         }
     except Exception as exc:  # noqa: BLE001
@@ -147,5 +213,6 @@ async def fetch_page_info(username: str) -> dict:
             "title": None,
             "url": target_url,
             "html_length": 0,
+            "network": [],
             "error": str(exc),
         }

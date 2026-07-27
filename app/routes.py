@@ -5,7 +5,7 @@ routes.py - API route definitions for the TikTok Story API.
 from fastapi import APIRouter, Depends, Query
 
 from app.auth import verify_api_key
-from app.models import HealthResponse, RootResponse, PageInfo, StoriesPageResponse
+from app.models import HealthResponse, RootResponse, PageInfo, StoriesPageResponse, NetworkRequest
 from app.scraper import fetch_page_info
 from app.config import settings
 
@@ -40,8 +40,9 @@ async def health() -> HealthResponse:
     summary="Get TikTok stories",
     description=(
         "Navigates to the TikTok profile page for the given username using a "
-        "headless Chromium browser and returns basic page metadata. "
-        "HTML story scraping is not yet implemented (Phase 3). "
+        "headless Chromium browser and returns basic page metadata alongside "
+        "intercepted API network requests. "
+        "Story scraping is not yet implemented. "
         "Requires a valid Bearer token in the Authorization header."
     ),
     dependencies=[Depends(verify_api_key)],  # 🔒 Protected
@@ -51,10 +52,10 @@ async def get_stories(
 ) -> StoriesPageResponse:
     """
     Protected endpoint — launches a Playwright Chromium browser, navigates
-    to https://www.tiktok.com/@{username}, and returns the page title and
-    final URL.
+    to https://www.tiktok.com/@{username}, intercepts network traffic, and
+    returns the page title, final URL, and filtered API network requests.
 
-    Story scraping will be added in Phase 3.
+    Story scraping will be added in a future phase.
     """
     result = await fetch_page_info(username)
     return StoriesPageResponse(
@@ -65,4 +66,14 @@ async def get_stories(
             url=result["url"],
             html_length=result.get("html_length"),
         ),
+        network=[
+            NetworkRequest(
+                url=entry["url"],
+                method=entry["method"],
+                status=entry["status"],
+                resource_type=entry["resource_type"],
+            )
+            for entry in result.get("network", [])
+        ],
     )
+

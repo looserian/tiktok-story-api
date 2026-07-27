@@ -43,11 +43,20 @@ class PageInfo(BaseModel):
     html_length: int | None = None
 
 
+class NetworkRequest(BaseModel):
+    """A single captured network request/response pair."""
+    url: str
+    method: str
+    status: int
+    resource_type: str
+
+
 class StoriesPageResponse(BaseModel):
-    """Response model for the /stories endpoint (Phase 2)."""
+    """Response model for the /stories endpoint (Phase 2 / Phase 3)."""
     success: bool
     username: str
     page: PageInfo
+    network: list[NetworkRequest] = []
 
 
 class ErrorResponse(BaseModel):
