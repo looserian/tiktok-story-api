@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from app.auth import verify_api_key
 from app.config import settings
@@ -22,7 +23,7 @@ from app.models import (
     ParsedStoriesResponse,
     RootResponse,
 )
-from app.scraper import fetch_page_info
+from app.scraper import fetch_page_info, download_story_media
 from app.utils.parser import parse_story_response
 from app.utils.story_store import get_last_story_id, set_last_story_id
 
@@ -375,4 +376,200 @@ async def get_latest_story(
         username=response_username,
         new_story=is_new,
         latest_story=ParsedStory(**newest),
+    )
+
+
+# ── Download endpoint ────────────────────────────────────────────────────────────────
+
+_404_download = {
+    "model": ErrorResponse,
+    "description": "Story ID not found for this user.",
+    "content": {
+        "application/json": {
+            "example": {"success": False, "error": "Story not found."}
+        }
+    },
+}
+
+
+@router.get(
+    "/download/{story_id}",
+    summary="Download a single story (image or video)",
+    description=(
+        "Fetches all stories for *username*, locates the story whose ``id`` "
+        "matches *story_id*, downloads the raw media bytes through the same "
+        "Playwright browser session (so TikTok receives proper cookies and "
+        "headers), and streams the file directly to the caller.\n\n"
+        "- **Image stories** — returns the first image as ``image/jpeg``.\n"
+        "- **Video stories** — downloads via ``download_url`` and returns as ``video/mp4``.\n\n"
+        "TikTok CDN URLs are **never** exposed to the client.\n\n"
+        "**Authentication** — same API key as ``/stories``:\n"
+        "- `X-API-Key: <your_key>` header\n"
+        "- `Authorization: Bearer <your_key>` header\n\n"
+        "**Typical latency** — 15–40 seconds (browser cold-start + page warm-up + download)."
+    ),
+    tags=["Stories"],
+    responses={
+        200: {
+            "description": "Binary media file streamed to the client.",
+            "content": {
+                "video/mp4": {},
+                "image/jpeg": {},
+            },
+        },
+        401: _401,
+        404: _404_download,
+        502: _502,
+    },
+    dependencies=[Depends(verify_api_key)],  # 🔒 Protected
+)
+async def download_story(
+    story_id: str,
+    username: str = Query(
+        ...,
+        description="TikTok username to fetch stories for (without the leading `@`).",
+        examples=["rtrt2805"],
+        min_length=1,
+        max_length=64,
+    ),
+) -> StreamingResponse:
+    """
+    Protected endpoint — proxy-downloads a single TikTok story to the caller.
+
+    Error conditions returned as structured JSON:
+
+    | HTTP | Condition |
+    |------|-----------|
+    | 401  | Missing or invalid API key |
+    | 404  | Story ID not found for this user / no active stories |
+    | 502  | TikTok blocked the request or the browser failed |
+    | 500  | Unexpected internal error |
+    """
+    logger.info(
+        "download_story: starting  username=%r  story_id=%r", username, story_id
+    )
+
+    # ── Step 1: Fetch all stories for the user ────────────────────────────────
+    result = await fetch_page_info(username)
+
+    if not result.get("success"):
+        error_msg = result.get("error", "")
+        logger.error(
+            "download_story: scraper failed  username=%r  error=%s", username, error_msg
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "success": False,
+                "error": (
+                    "TikTok temporarily blocked the request. Try again in a few minutes."
+                    if not error_msg
+                    else f"Browser error: {error_msg}"
+                ),
+            },
+        )
+
+    story_json: dict | None = result.get("story_json")
+    if story_json is None:
+        logger.warning(
+            "download_story: no story API response  username=%r", username
+        )
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "success": False,
+                "error": (
+                    "No stories found for this user. "
+                    "The account may be private, have no active stories, or the username is invalid."
+                ),
+            },
+        )
+
+    parsed = parse_story_response(story_json)
+    stories: list[dict] = parsed.get("stories") or []
+
+    if not stories:
+        logger.warning(
+            "download_story: parser returned 0 stories  username=%r", username
+        )
+        raise HTTPException(
+            status_code=404,
+            detail={"success": False, "error": "No active stories found for this user."},
+        )
+
+    # ── Step 2: Locate the requested story by ID ────────────────────────────
+    story: dict | None = next(
+        (s for s in stories if str(s.get("id", "")) == story_id), None
+    )
+
+    if story is None:
+        logger.warning(
+            "download_story: story_id not found  username=%r  story_id=%r",
+            username,
+            story_id,
+        )
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "success": False,
+                "error": f"Story '{story_id}' not found for user '{username}'.",
+            },
+        )
+
+    # ── Step 3: Determine media type and URL ───────────────────────────────
+    story_type: str = story.get("type", "video")
+
+    if story_type == "image":
+        images: list[str] = story.get("images") or []
+        if not images:
+            raise HTTPException(
+                status_code=404,
+                detail={"success": False, "error": "Image story has no image URLs."},
+            )
+        media_url: str = images[0]  # Download the first (and usually only) image
+        content_type = "image/jpeg"
+        filename = f"{story_id}.jpg"
+    else:
+        # Prefer download_url for videos (watermark-free on some accounts)
+        media_url = story.get("download_url") or story.get("video_url") or ""
+        if not media_url:
+            raise HTTPException(
+                status_code=404,
+                detail={"success": False, "error": "Video story has no downloadable URL."},
+            )
+        content_type = "video/mp4"
+        filename = f"{story_id}.mp4"
+
+    logger.info(
+        "download_story: resolved  type=%s  filename=%s  url=%s",
+        story_type,
+        filename,
+        media_url,
+    )
+
+    # ── Step 4: Proxy-download via the Playwright browser session ─────────
+    try:
+        media_stream = download_story_media(username=username, media_url=media_url)
+    except Exception as exc:
+        logger.exception("download_story: failed to initialise media stream")
+        raise HTTPException(
+            status_code=502,
+            detail={"success": False, "error": f"Failed to start media download: {exc}"},
+        ) from exc
+
+    # ── Step 5: Stream back to the caller ─────────────────────────────────
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }
+
+    logger.info(
+        "download_story: streaming response  filename=%s  content_type=%s",
+        filename,
+        content_type,
+    )
+
+    return StreamingResponse(
+        content=media_stream,
+        media_type=content_type,
+        headers=headers,
     )

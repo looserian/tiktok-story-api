@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+from typing import AsyncIterator
 
 from playwright.async_api import async_playwright, Error as PlaywrightError, Request, Response
 
@@ -247,3 +248,113 @@ async def fetch_page_info(username: str) -> dict:
             "network": [],
             "error": str(exc),
         }
+
+
+async def download_story_media(
+    username: str,
+    media_url: str,
+    chunk_size: int = 65536,
+) -> AsyncIterator[bytes]:
+    """
+    Download TikTok media bytes using a Playwright browser session so that
+    TikTok receives its expected cookies and request headers.
+
+    Workflow
+    --------
+    1. Launch headless Chromium with the same UA used by ``fetch_page_info``.
+    2. Navigate to the user's TikTok profile page so the browser establishes
+       a valid session (cookies, CORS tokens, etc.).
+    3. Use Playwright's ``APIRequestContext`` (which shares the browser
+       context's cookie jar) to fetch *media_url* with a proper ``Referer``
+       and ``Range`` header.
+    4. Yield the response body in *chunk_size* chunks so FastAPI's
+       ``StreamingResponse`` can forward them without buffering everything
+       in RAM.
+
+    Args:
+        username:   TikTok username (without the leading ``@``).
+        media_url:  The internal TikTok CDN/playback URL to download.
+        chunk_size: Byte size of each yielded chunk (default 64 KiB).
+
+    Yields:
+        Raw ``bytes`` chunks of the media file.
+
+    Raises:
+        RuntimeError: On any Playwright or HTTP-level failure.
+    """
+    profile_url = f"{TIKTOK_BASE_URL}/@{username}"
+    logger.info(
+        "download_story_media: starting  username=%r  media_url=%s",
+        username,
+        media_url,
+    )
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            try:
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    locale="en-US",
+                )
+
+                # ── Warm up the session: navigate to profile so TikTok sets
+                #    its cookies and the APIRequestContext inherits them.
+                page = await context.new_page()
+                logger.info(
+                    "download_story_media: warming session  url=%s", profile_url
+                )
+                try:
+                    await page.goto(profile_url, wait_until="domcontentloaded", timeout=30_000)
+                except Exception as nav_exc:
+                    # Non-fatal — session may still be usable.
+                    logger.warning(
+                        "download_story_media: profile nav warning — %s", nav_exc
+                    )
+
+                # Brief settle so TikTok JS can set its session cookies.
+                await asyncio.sleep(3)
+                await page.close()
+
+                # ── Fetch the media via the cookie-bearing API context ────────
+                api_request = context.request
+                logger.info("download_story_media: fetching media bytes")
+
+                response = await api_request.get(
+                    media_url,
+                    headers={
+                        "Referer": profile_url,
+                        "Origin": TIKTOK_BASE_URL,
+                    },
+                )
+
+                if not response.ok:
+                    raise RuntimeError(
+                        f"TikTok CDN returned HTTP {response.status} for media URL."
+                    )
+
+                body: bytes = await response.body()
+                logger.info(
+                    "download_story_media: received %d bytes", len(body)
+                )
+
+                # Yield in chunks so callers can stream the response.
+                for offset in range(0, len(body), chunk_size):
+                    yield body[offset : offset + chunk_size]
+
+            finally:
+                await browser.close()
+                logger.debug("download_story_media: browser closed")
+
+    except PlaywrightError as exc:
+        logger.error("download_story_media: Playwright error — %s", exc)
+        raise RuntimeError(f"Browser error while downloading media: {exc}") from exc
+    except RuntimeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("download_story_media: unexpected error")
+        raise RuntimeError(f"Unexpected error while downloading media: {exc}") from exc
