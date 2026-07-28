@@ -82,6 +82,18 @@ class ParsedStory(BaseModel):
         examples=[["https://p16.tiktokcdn.com/obj/example.webp"]],
     )
 
+    # ── Audio (image stories with background music) ───────────────────────────
+    # Present on image stories that have a TikTok sound attached.
+    # Always ``null`` for video stories (the audio is part of the video stream).
+    audio_url: str | None = Field(
+        None,
+        description=(
+            "Direct URL to the background audio track for image stories. "
+            "``null`` when the story has no audio or for video stories."
+        ),
+        examples=["https://sf16-ies-music.tiktokcdn.com/obj/musically-maliva-obj/example.mp3"],
+    )
+
     # ── Video story fields ────────────────────────────────────────────────────
     video_url: str | None = Field(None, examples=["https://v19.tiktok.com/..."])
     download_url: str | None = Field(None, examples=["https://v19.tiktok.com/..."])

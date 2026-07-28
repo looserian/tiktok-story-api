@@ -109,42 +109,64 @@ async def fetch_page_info(username: str) -> dict:
     # Final filtered list of captured network entries.
     network_log: list[dict] = []
 
-    # Raw JSON payload from TikTok's Story API (None until captured).
-    _story_json: dict | None = None
+    # Accumulated items from all intercepted /api/story/item_list/ pages.
+    # We keep every item seen so that multiple auto-triggered pages are merged.
+    _all_items: list[dict] = []
+
+    # Envelope fields from the *last* intercepted page (status_code, etc.).
+    # We overwrite on each page so the final merged JSON looks like one response.
+    _envelope: dict | None = None
+
+    # Base URL of the story endpoint (without query params) so we can call it
+    # directly when paginating.  Captured from the first matching request.
+    _story_base_url: str | None = None
+
+    # Cursor and has_more from the last intercepted page.
+    _cursor: int = 0
+    _has_more: bool = False
 
     def _on_request(request: Request) -> None:
         """Store resource type keyed by URL for later correlation."""
+        nonlocal _story_base_url
         _request_meta[request.url] = request.resource_type
+        # Capture the base URL of the story endpoint on first match so we can
+        # re-use it for manual pagination after the page has loaded.
+        if _story_base_url is None and "/api/story/item_list/" in request.url:
+            # Strip query-string — we'll supply our own params.
+            _story_base_url = request.url.split("?")[0]
+            logger.debug("fetch_page_info: story base URL captured → %s", _story_base_url)
 
     async def _on_response(response: Response) -> None:
-        """Correlate response with stored request meta and filter by keyword."""
-        nonlocal _story_json
+        """Accumulate story items from every intercepted story-list page."""
+        nonlocal _envelope, _cursor, _has_more
         url = response.url
         # Only inspect the Story API
         if "/api/story/item_list/" in url:
-
-            logger.info("Story API detected!")
+            logger.info("fetch_page_info: story API page intercepted  url=%s", url)
 
             try:
                 body = await response.json()
-                logger.info("Story API JSON received")
-                # Store for the caller so it can be parsed without re-reading disk.
-                _story_json = body
-
             except Exception as e:
-                logger.warning(f"Couldn't parse JSON: {e}")
-                body = await response.text()
+                logger.warning("fetch_page_info: couldn't parse story JSON — %s", e)
+                return
 
-            SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+            page_items: list[dict] = body.get("itemList") or []
+            _all_items.extend(page_items)
 
-            story_path = SCREENSHOTS_DIR / "story_response.json"
+            # Track pagination state from this page.
+            _cursor = body.get("cursor") or body.get("minCursor") or 0
+            _has_more = bool(body.get("has_more") or body.get("hasMore"))
 
-            story_path.write_text(
-                json.dumps(body, indent=2, ensure_ascii=False),
-                encoding="utf-8",
+            logger.info(
+                "fetch_page_info: intercepted page  items=%d  cursor=%s  has_more=%s",
+                len(page_items),
+                _cursor,
+                _has_more,
             )
 
-            logger.info("Saved Story API response")
+            # Save envelope metadata (minus the items) for building the merged response.
+            _envelope = {k: v for k, v in body.items() if k != "itemList"}
+
         if not _is_api_url(url):
             return
         entry = {
@@ -192,6 +214,115 @@ async def fetch_page_info(username: str) -> dict:
         )
         await asyncio.sleep(DEBUG_SETTLE_SECONDS)
 
+        # ── Paginate: fetch remaining pages via the existing session ─────────
+        # After the page has loaded, TikTok may have only auto-fetched page 1.
+        # If has_more is still true we explicitly request subsequent pages via
+        # context.request (which shares the same cookies) until exhausted.
+        if _story_base_url and _has_more:
+            logger.info(
+                "fetch_page_info: starting manual pagination  cursor=%s  "
+                "items_so_far=%d",
+                _cursor,
+                len(_all_items),
+            )
+            _page_num = 2
+            _current_cursor = _cursor
+            _continue = _has_more
+
+            while _continue:
+                logger.info(
+                    "fetch_page_info: fetching page %d  cursor=%s",
+                    _page_num,
+                    _current_cursor,
+                )
+                try:
+                    api_resp = await context.request.get(
+                        _story_base_url,
+                        params={
+                            "cursor": str(_current_cursor),
+                            "count": "20",
+                        },
+                        headers={
+                            "Referer": target_url,
+                            "Origin": TIKTOK_BASE_URL,
+                        },
+                    )
+
+                    if not api_resp.ok:
+                        logger.warning(
+                            "fetch_page_info: pagination request returned HTTP %d — stopping",
+                            api_resp.status,
+                        )
+                        break
+
+                    page_body: dict = await api_resp.json()
+                    page_items: list[dict] = page_body.get("itemList") or []
+                    _all_items.extend(page_items)
+
+                    _current_cursor = (
+                        page_body.get("cursor")
+                        or page_body.get("minCursor")
+                        or 0
+                    )
+                    _continue = bool(
+                        page_body.get("has_more") or page_body.get("hasMore")
+                    )
+
+                    logger.info(
+                        "fetch_page_info: page %d done  items=%d  cursor=%s  has_more=%s  total_so_far=%d",
+                        _page_num,
+                        len(page_items),
+                        _current_cursor,
+                        _continue,
+                        len(_all_items),
+                    )
+                    _page_num += 1
+
+                    # Safety: stop if a page returned no items to avoid an
+                    # infinite loop when TikTok returns has_more=true but an
+                    # empty list (sometimes happens at the real end).
+                    if not page_items:
+                        logger.info(
+                            "fetch_page_info: empty page returned — stopping pagination"
+                        )
+                        break
+
+                except Exception as page_exc:  # noqa: BLE001
+                    logger.warning(
+                        "fetch_page_info: pagination error on page %d — %s",
+                        _page_num,
+                        page_exc,
+                    )
+                    break
+
+        logger.info(
+            "fetch_page_info: pagination complete  total_items_from_tiktok=%d",
+            len(_all_items),
+        )
+
+        # ── Build the merged story_json ───────────────────────────────────────
+        # Combine the envelope (from last intercepted page) with all accumulated
+        # items so the parser sees a single dict with the full itemList.
+        _story_json: dict | None = None
+        if _envelope is not None:
+            _story_json = {**_envelope, "itemList": _all_items}
+        elif _all_items:
+            # Fallback: no envelope captured but items were collected.
+            _story_json = {"itemList": _all_items}
+
+        # Save merged response for debugging.
+        if _story_json is not None:
+            SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+            story_path = SCREENSHOTS_DIR / "story_response.json"
+            story_path.write_text(
+                json.dumps(_story_json, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info(
+                "fetch_page_info: saved merged story response  total_items=%d",
+                len(_all_items),
+            )
+
         # ── Gather page info ─────────────────────────────────────────────────
         title = await page.title()
         current_url = page.url
@@ -238,7 +369,8 @@ async def fetch_page_info(username: str) -> dict:
             "url": current_url,
             "html_length": html_length,
             "network": network_log,
-            # Raw Story API payload — None if TikTok never fired the endpoint.
+            # Merged Story API payload containing all pages.
+            # None if TikTok never fired the endpoint.
             "story_json": _story_json,
             # ── Live browser objects for session reuse ────────────────────────
             # Caller must call _browser.close() when finished.
