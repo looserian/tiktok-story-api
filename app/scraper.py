@@ -13,7 +13,14 @@ import logging
 from pathlib import Path
 from typing import AsyncIterator
 
-from playwright.async_api import async_playwright, Error as PlaywrightError, Request, Response
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Error as PlaywrightError,
+    Request,
+    Response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +34,12 @@ DEBUG_SETTLE_SECONDS = 8
 
 # URL keywords that identify interesting API calls worth capturing.
 NETWORK_KEYWORDS = ("api", "story", "stories", "feed", "post", "item", "aweme")
+
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def _is_api_url(url: str) -> bool:
@@ -43,7 +56,7 @@ async def fetch_page_info(username: str) -> dict:
 
     Captured network data is also written to ``screenshots/network.json``.
 
-    Debug artifacts written to ``screenshots/``:
+    Debug artifacts written to ``screenshots/``):
 
     - ``screenshots/debug.png``   — full-page screenshot
     - ``screenshots/debug.html``  — raw page HTML
@@ -63,11 +76,24 @@ async def fetch_page_info(username: str) -> dict:
                 "network": [
                     {"url": "...", "method": "GET", "status": 200, "resource_type": "xhr"},
                     ...
-                ]
+                ],
+                "story_json": <dict | None>,
+                # Internal: live browser objects for download reuse.
+                # Present only when success=True.
+                "_browser":  <Browser>,
+                "_context":  <BrowserContext>,
             }
 
         On failure the dict will have ``"success": False`` and an
         ``"error"`` key with a human-readable message.
+
+    Important
+    ---------
+    When ``success=True`` the caller receives a live ``_browser`` and
+    ``_context``.  The caller is responsible for closing them (via
+    ``browser.close()``) after the data has been consumed.  The download
+    helper ``download_story_media`` does this automatically after streaming
+    is complete.
     """
     target_url = f"{TIKTOK_BASE_URL}/@{username}"
     logger.info(
@@ -135,91 +161,91 @@ async def fetch_page_info(username: str) -> dict:
             url,
         )
 
+    # We hold pw / browser / context alive deliberately so the caller can
+    # reuse the warmed-up session for a subsequent media download.
+    # The caller MUST call browser.close() when done.
     try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            logger.debug("fetch_page_info: Chromium launched")
+        pw = await async_playwright().start()
+        browser: Browser = await pw.chromium.launch(headless=True)
+        logger.debug("fetch_page_info: Chromium launched")
 
-            try:
-                context = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    locale="en-US",
-                )
-                page = await context.new_page()
+        context: BrowserContext = await browser.new_context(
+            user_agent=_UA,
+            locale="en-US",
+        )
+        page = await context.new_page()
 
-                # ── Register network listeners BEFORE navigation ─────────────
-                page.on("request", _on_request)
-                page.on("response", _on_response)
-                logger.debug("fetch_page_info: network listeners registered")
+        # ── Register network listeners BEFORE navigation ─────────────────────
+        page.on("request", _on_request)
+        page.on("response", _on_response)
+        logger.debug("fetch_page_info: network listeners registered")
 
-                # ── Navigate ─────────────────────────────────────────────────
-                logger.info("fetch_page_info: navigating to %s", target_url)
-                await page.goto(target_url, wait_until="load")
-                logger.info("fetch_page_info: page load event fired")
+        # ── Navigate ─────────────────────────────────────────────────────────
+        logger.info("fetch_page_info: navigating to %s", target_url)
+        await page.goto(target_url, wait_until="load")
+        logger.info("fetch_page_info: page load event fired")
 
-                # ── Settle wait ──────────────────────────────────────────────
-                logger.info(
-                    "fetch_page_info: waiting %d seconds for dynamic content to settle",
-                    DEBUG_SETTLE_SECONDS,
-                )
-                await asyncio.sleep(DEBUG_SETTLE_SECONDS)
+        # ── Settle wait ──────────────────────────────────────────────────────
+        logger.info(
+            "fetch_page_info: waiting %d seconds for dynamic content to settle",
+            DEBUG_SETTLE_SECONDS,
+        )
+        await asyncio.sleep(DEBUG_SETTLE_SECONDS)
 
-                # ── Gather page info ─────────────────────────────────────────
-                title = await page.title()
-                current_url = page.url
-                html_content = await page.content()
-                html_length = len(html_content)
+        # ── Gather page info ─────────────────────────────────────────────────
+        title = await page.title()
+        current_url = page.url
+        html_content = await page.content()
+        html_length = len(html_content)
 
-                logger.info(
-                    "fetch_page_info: page ready  title=%r  url=%s  html_length=%d  "
-                    "network_entries=%d",
-                    title,
-                    current_url,
-                    html_length,
-                    len(network_log),
-                )
+        logger.info(
+            "fetch_page_info: page ready  title=%r  url=%s  html_length=%d  "
+            "network_entries=%d",
+            title,
+            current_url,
+            html_length,
+            len(network_log),
+        )
 
-                # ── Save debug artifacts ─────────────────────────────────────
-                SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        # ── Save debug artifacts ─────────────────────────────────────────────
+        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-                screenshot_path = SCREENSHOTS_DIR / "debug.png"
-                html_path = SCREENSHOTS_DIR / "debug.html"
-                network_path = SCREENSHOTS_DIR / "network.json"
+        screenshot_path = SCREENSHOTS_DIR / "debug.png"
+        html_path = SCREENSHOTS_DIR / "debug.html"
+        network_path = SCREENSHOTS_DIR / "network.json"
 
-                await page.screenshot(path=str(screenshot_path), full_page=True)
-                logger.info("fetch_page_info: screenshot saved → %s", screenshot_path)
+        await page.screenshot(path=str(screenshot_path), full_page=True)
+        logger.info("fetch_page_info: screenshot saved → %s", screenshot_path)
 
-                html_path.write_text(html_content, encoding="utf-8")
-                logger.info("fetch_page_info: HTML saved → %s", html_path)
+        html_path.write_text(html_content, encoding="utf-8")
+        logger.info("fetch_page_info: HTML saved → %s", html_path)
 
-                network_path.write_text(
-                    json.dumps(network_log, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                logger.info(
-                    "fetch_page_info: network log saved → %s  (%d entries)",
-                    network_path,
-                    len(network_log),
-                )
+        network_path.write_text(
+            json.dumps(network_log, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info(
+            "fetch_page_info: network log saved → %s  (%d entries)",
+            network_path,
+            len(network_log),
+        )
 
-                return {
-                    "success": True,
-                    "title": title,
-                    "url": current_url,
-                    "html_length": html_length,
-                    "network": network_log,
-                    # Raw Story API payload — None if TikTok never fired the endpoint.
-                    "story_json": _story_json,
-                }
-
-            finally:
-                # Always close the browser, even if an exception occurred.
-                await browser.close()
-                logger.debug("fetch_page_info: browser closed")
+        # Leave page open (keeps session warm) — the caller decides when to
+        # close the browser.
+        return {
+            "success": True,
+            "title": title,
+            "url": current_url,
+            "html_length": html_length,
+            "network": network_log,
+            # Raw Story API payload — None if TikTok never fired the endpoint.
+            "story_json": _story_json,
+            # ── Live browser objects for session reuse ────────────────────────
+            # Caller must call _browser.close() when finished.
+            "_browser": browser,
+            "_context": context,
+            "_pw": pw,
+        }
 
     except PlaywrightError as exc:
         logger.error(
@@ -251,29 +277,38 @@ async def fetch_page_info(username: str) -> dict:
 
 
 async def download_story_media(
-    username: str,
     media_url: str,
+    context: BrowserContext,
+    browser: Browser,
+    pw,
+    username: str,
     chunk_size: int = 65536,
 ) -> AsyncIterator[bytes]:
     """
-    Download TikTok media bytes using a Playwright browser session so that
-    TikTok receives its expected cookies and request headers.
+    Download TikTok media bytes through the **existing** Playwright
+    ``BrowserContext`` that was used to fetch the stories.
+
+    By reusing the same context the download request inherits the session
+    cookies, browser fingerprint, and any JS-set tokens that TikTok's CDN
+    expects — avoiding the HTTP 403 that a fresh httpx / requests call
+    would receive.
 
     Workflow
     --------
-    1. Launch headless Chromium with the same UA used by ``fetch_page_info``.
-    2. Navigate to the user's TikTok profile page so the browser establishes
-       a valid session (cookies, CORS tokens, etc.).
-    3. Use Playwright's ``APIRequestContext`` (which shares the browser
-       context's cookie jar) to fetch *media_url* with a proper ``Referer``
-       and ``Range`` header.
-    4. Yield the response body in *chunk_size* chunks so FastAPI's
+    1. Use the caller-supplied *context* (already warmed up by
+       ``fetch_page_info``) to make a ``context.request.get()`` call.
+    2. Yield the response body in *chunk_size* chunks so FastAPI's
        ``StreamingResponse`` can forward them without buffering everything
        in RAM.
+    3. Close the browser (and the Playwright instance) when done so we
+       don't leak browser processes.
 
     Args:
-        username:   TikTok username (without the leading ``@``).
         media_url:  The internal TikTok CDN/playback URL to download.
+        context:    The live ``BrowserContext`` from ``fetch_page_info``.
+        browser:    The live ``Browser`` instance (will be closed after use).
+        pw:         The live ``Playwright`` instance (will be stopped after use).
+        username:   TikTok username — used only for the ``Referer`` header.
         chunk_size: Byte size of each yielded chunk (default 64 KiB).
 
     Yields:
@@ -284,71 +319,33 @@ async def download_story_media(
     """
     profile_url = f"{TIKTOK_BASE_URL}/@{username}"
     logger.info(
-        "download_story_media: starting  username=%r  media_url=%s",
+        "download_story_media: fetching via existing session  username=%r  media_url=%s",
         username,
         media_url,
     )
 
     try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
-            try:
-                context = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                    locale="en-US",
-                )
+        api_request = context.request
 
-                # ── Warm up the session: navigate to profile so TikTok sets
-                #    its cookies and the APIRequestContext inherits them.
-                page = await context.new_page()
-                logger.info(
-                    "download_story_media: warming session  url=%s", profile_url
-                )
-                try:
-                    await page.goto(profile_url, wait_until="domcontentloaded", timeout=30_000)
-                except Exception as nav_exc:
-                    # Non-fatal — session may still be usable.
-                    logger.warning(
-                        "download_story_media: profile nav warning — %s", nav_exc
-                    )
+        response = await api_request.get(
+            media_url,
+            headers={
+                "Referer": profile_url,
+                "Origin": TIKTOK_BASE_URL,
+            },
+        )
 
-                # Brief settle so TikTok JS can set its session cookies.
-                await asyncio.sleep(3)
-                await page.close()
+        if not response.ok:
+            raise RuntimeError(
+                f"TikTok CDN returned HTTP {response.status} for media URL."
+            )
 
-                # ── Fetch the media via the cookie-bearing API context ────────
-                api_request = context.request
-                logger.info("download_story_media: fetching media bytes")
+        body: bytes = await response.body()
+        logger.info("download_story_media: received %d bytes", len(body))
 
-                response = await api_request.get(
-                    media_url,
-                    headers={
-                        "Referer": profile_url,
-                        "Origin": TIKTOK_BASE_URL,
-                    },
-                )
-
-                if not response.ok:
-                    raise RuntimeError(
-                        f"TikTok CDN returned HTTP {response.status} for media URL."
-                    )
-
-                body: bytes = await response.body()
-                logger.info(
-                    "download_story_media: received %d bytes", len(body)
-                )
-
-                # Yield in chunks so callers can stream the response.
-                for offset in range(0, len(body), chunk_size):
-                    yield body[offset : offset + chunk_size]
-
-            finally:
-                await browser.close()
-                logger.debug("download_story_media: browser closed")
+        # Yield in chunks so callers can stream the response.
+        for offset in range(0, len(body), chunk_size):
+            yield body[offset : offset + chunk_size]
 
     except PlaywrightError as exc:
         logger.error("download_story_media: Playwright error — %s", exc)
@@ -358,3 +355,16 @@ async def download_story_media(
     except Exception as exc:  # noqa: BLE001
         logger.exception("download_story_media: unexpected error")
         raise RuntimeError(f"Unexpected error while downloading media: {exc}") from exc
+    finally:
+        # Always release the browser resources after the stream is exhausted
+        # (or on error), regardless of whether the download succeeded.
+        try:
+            await browser.close()
+            logger.debug("download_story_media: browser closed")
+        except Exception:
+            pass
+        try:
+            await pw.stop()
+            logger.debug("download_story_media: playwright stopped")
+        except Exception:
+            pass

@@ -175,6 +175,20 @@ async def get_stories(
             },
         )
 
+    # fetch_page_info keeps the browser alive — close it now that we only need the JSON.
+    _browser = result.get("_browser")
+    _pw = result.get("_pw")
+    try:
+        if _browser:
+            await _browser.close()
+    except Exception:
+        pass
+    try:
+        if _pw:
+            await _pw.stop()
+    except Exception:
+        pass
+
     # ── Story API was never intercepted ──────────────────────────────────────
     story_json: dict | None = result.get("story_json")
     if story_json is None:
@@ -298,6 +312,20 @@ async def get_latest_story(
                 ),
             },
         )
+
+    # fetch_page_info keeps the browser alive — close it now that we only need the JSON.
+    _browser = result.get("_browser")
+    _pw = result.get("_pw")
+    try:
+        if _browser:
+            await _browser.close()
+    except Exception:
+        pass
+    try:
+        if _pw:
+            await _pw.stop()
+    except Exception:
+        pass
 
     # ── Story API was never intercepted ──────────────────────────────────────
     story_json: dict | None = result.get("story_json")
@@ -436,6 +464,10 @@ async def download_story(
     """
     Protected endpoint — proxy-downloads a single TikTok story to the caller.
 
+    The media is fetched through the **same** Playwright BrowserContext that
+    was used to scrape the story list, so TikTok's CDN receives the correct
+    cookies and session headers and does not return HTTP 403.
+
     Error conditions returned as structured JSON:
 
     | HTTP | Condition |
@@ -449,14 +481,34 @@ async def download_story(
         "download_story: starting  username=%r  story_id=%r", username, story_id
     )
 
-    # ── Step 1: Fetch all stories for the user ────────────────────────────────
+    # ── Step 1: Fetch all stories — browser stays alive after this call ───────
     result = await fetch_page_info(username)
+
+    # Grab the live browser objects before any early-return paths so we can
+    # clean them up on error.
+    _browser = result.get("_browser")
+    _context = result.get("_context")
+    _pw = result.get("_pw")
+
+    async def _close_browser() -> None:
+        """Best-effort cleanup of the live Playwright session."""
+        try:
+            if _browser:
+                await _browser.close()
+        except Exception:
+            pass
+        try:
+            if _pw:
+                await _pw.stop()
+        except Exception:
+            pass
 
     if not result.get("success"):
         error_msg = result.get("error", "")
         logger.error(
             "download_story: scraper failed  username=%r  error=%s", username, error_msg
         )
+        await _close_browser()
         raise HTTPException(
             status_code=502,
             detail={
@@ -474,6 +526,7 @@ async def download_story(
         logger.warning(
             "download_story: no story API response  username=%r", username
         )
+        await _close_browser()
         raise HTTPException(
             status_code=404,
             detail={
@@ -492,12 +545,13 @@ async def download_story(
         logger.warning(
             "download_story: parser returned 0 stories  username=%r", username
         )
+        await _close_browser()
         raise HTTPException(
             status_code=404,
             detail={"success": False, "error": "No active stories found for this user."},
         )
 
-    # ── Step 2: Locate the requested story by ID ────────────────────────────
+    # ── Step 2: Locate the requested story by ID ──────────────────────────────
     story: dict | None = next(
         (s for s in stories if str(s.get("id", "")) == story_id), None
     )
@@ -508,6 +562,7 @@ async def download_story(
             username,
             story_id,
         )
+        await _close_browser()
         raise HTTPException(
             status_code=404,
             detail={
@@ -516,12 +571,13 @@ async def download_story(
             },
         )
 
-    # ── Step 3: Determine media type and URL ───────────────────────────────
+    # ── Step 3: Determine media type and URL ──────────────────────────────────
     story_type: str = story.get("type", "video")
 
     if story_type == "image":
         images: list[str] = story.get("images") or []
         if not images:
+            await _close_browser()
             raise HTTPException(
                 status_code=404,
                 detail={"success": False, "error": "Image story has no image URLs."},
@@ -533,6 +589,7 @@ async def download_story(
         # Prefer download_url for videos (watermark-free on some accounts)
         media_url = story.get("download_url") or story.get("video_url") or ""
         if not media_url:
+            await _close_browser()
             raise HTTPException(
                 status_code=404,
                 detail={"success": False, "error": "Video story has no downloadable URL."},
@@ -547,17 +604,27 @@ async def download_story(
         media_url,
     )
 
-    # ── Step 4: Proxy-download via the Playwright browser session ─────────
+    # ── Step 4: Proxy-download via the EXISTING Playwright browser session ────
+    # Pass the live context / browser / pw so the download request inherits
+    # the exact same cookies and session tokens that fetched the story list.
+    # download_story_media closes the browser in its finally block.
     try:
-        media_stream = download_story_media(username=username, media_url=media_url)
+        media_stream = download_story_media(
+            media_url=media_url,
+            context=_context,
+            browser=_browser,
+            pw=_pw,
+            username=username,
+        )
     except Exception as exc:
         logger.exception("download_story: failed to initialise media stream")
+        await _close_browser()
         raise HTTPException(
             status_code=502,
             detail={"success": False, "error": f"Failed to start media download: {exc}"},
         ) from exc
 
-    # ── Step 5: Stream back to the caller ─────────────────────────────────
+    # ── Step 5: Stream back to the caller ─────────────────────────────────────
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
     }
