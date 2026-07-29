@@ -1,30 +1,29 @@
 """
-tiktok_client.py - Direct async HTTP client for TikTok's internal Story API.
+tiktok_client.py - Direct async HTTP client for TikTok's internal JSON APIs.
 
-Replaces the Playwright/Chromium scraper with two plain httpx GET requests:
+Two-phase approach, both phases use plain JSON GET requests — no HTML
+parsing, no regex, no browser automation:
 
-  Phase 1 — resolve_sec_uid()
-      GET https://www.tiktok.com/@{username}
-      → parse the __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON blob embedded in
-        TikTok's SSR HTML to extract the user's ``secUid`` identifier.
-        No JavaScript execution required.
+  Phase 1 — resolve_author_id()
+      GET https://www.tiktok.com/api/user/detail/?uniqueId={username}&aid=1988
+      → extract the numeric ``author_id`` from TikTok's user-detail endpoint.
+        Fails fast with a typed exception if the user is not found or the
+        request is blocked before any story fetch is attempted.
 
   Phase 2 — fetch_stories_for_user()
       GET https://www.tiktok.com/api/story/item_list/
-          ?secUid={secUid}&count=30&cursor={cursor}
-      → paginate until has_more is falsy, accumulate all itemList entries,
-        return a merged dict shaped like a single TikTok API response page.
+          ?author_id={author_id}&count=30&cursor={cursor}&aid=1988
+      → paginate until ``has_more`` is falsy, accumulate all ``itemList``
+        entries, return a merged dict shaped like a single API response page.
 
-All requests use browser-mimicking headers (User-Agent, Sec-Ch-Ua, Sec-Fetch-*)
-to blend in with organic Chrome traffic. No cookies or authentication tokens
-are sent, keeping every request 100 % anonymous.
+All requests use browser-mimicking headers (User-Agent, Referer,
+Accept-Language) to blend in with organic Chrome traffic.  No cookies or
+authentication tokens are sent, keeping every request 100 % anonymous.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 
 import httpx
 
@@ -33,39 +32,23 @@ logger = logging.getLogger(__name__)
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 TIKTOK_BASE = "https://www.tiktok.com"
+_USER_DETAIL_PATH = "/api/user/detail/"
 _STORY_API_PATH = "/api/story/item_list/"
 
-# Chrome 124 on Windows — matches the UA used in the old Playwright session.
+# TikTok Web app-ID — required parameter on all internal API calls.
+_AID = "1988"
+
+# Chrome 124 on Windows.
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Headers for the profile page request (document navigation).
-_PROFILE_HEADERS: dict[str, str] = {
-    "User-Agent": _UA,
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,image/apng,*/*;"
-        "q=0.8,application/signed-exchange;v=b3;q=0.7"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-# Headers for the story API XHR (same-origin CORS request).
-_STORY_API_HEADERS: dict[str, str] = {
+# Base headers shared by every TikTok internal API call.
+# The ``Referer`` key is intentionally absent here — each call sets it
+# individually to the most appropriate value.
+_BASE_API_HEADERS: dict[str, str] = {
     "User-Agent": _UA,
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
@@ -80,21 +63,11 @@ _STORY_API_HEADERS: dict[str, str] = {
     "Sec-Fetch-Site": "same-origin",
 }
 
-# Regex to locate the SSR JSON blob in TikTok's HTML.
-# The blob is embedded as:
-#   <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">
-#     { ... }
-#   </script>
-_UDR_RE = re.compile(
-    r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
-    re.DOTALL,
-)
-
 
 # ── Typed exceptions ──────────────────────────────────────────────────────────
 
 class UserNotFoundError(Exception):
-    """The TikTok profile page was reached but the user does not exist."""
+    """The TikTok user does not exist or is not accessible."""
 
 
 class StoriesNotFoundError(Exception):
@@ -109,11 +82,11 @@ class TikTokBlockedError(Exception):
 
 def _make_client() -> httpx.AsyncClient:
     """
-    Return a shared httpx.AsyncClient instance with sensible defaults.
+    Return an ``httpx.AsyncClient`` configured with sensible defaults.
 
     - 30 s total timeout, 10 s connect timeout.
-    - HTTP/2 enabled (TikTok supports it and it reduces fingerprint risk).
-    - follow_redirects=True so profile URLs that redirect are handled silently.
+    - HTTP/2 enabled (TikTok supports it; reduces fingerprint risk).
+    - follow_redirects=True for transparent redirect handling.
     """
     return httpx.AsyncClient(
         timeout=httpx.Timeout(30.0, connect=10.0),
@@ -122,121 +95,165 @@ def _make_client() -> httpx.AsyncClient:
     )
 
 
-def _parse_sec_uid_from_html(html: str, username: str) -> str:
+def _check_tiktok_status(body: dict, context: str) -> None:
     """
-    Locate and extract the ``secUid`` field from TikTok's SSR JSON blob.
+    Inspect TikTok's internal ``statusCode`` field and raise a typed exception
+    if it indicates an error condition.
 
-    TikTok embeds a ``__UNIVERSAL_DATA_FOR_REHYDRATION__`` JSON object in every
-    profile page.  The relevant path inside that object is::
+    TikTok's JSON APIs always embed their own status code inside the response
+    body even when HTTP 200 is returned, for example::
 
-        .__DEFAULT_SCOPE__
-          .webapp.user-detail
-            .userInfo
-              .user
-                .secUid   ← what we need
+        {"statusCode": 10202, "userInfo": {}}   # user not found
+        {"statusCode": 0,     "userInfo": {...}} # success
 
-    Raises:
-        UserNotFoundError: If the blob is absent or the secUid key is missing.
-        TikTokBlockedError: If the blob is present but cannot be parsed as JSON
-            (e.g. TikTok served a CAPTCHA or bot-challenge page instead).
+    Known non-zero codes:
+        10201 / 10202 — user does not exist or is not found
+        10203         — user has been banned
+        10204         — private account
     """
-    match = _UDR_RE.search(html)
-    if not match:
+    status = body.get("statusCode") or body.get("status_code") or 0
+
+    if status == 0:
+        return  # success
+
+    # User-not-found variants
+    if status in (10201, 10202):
         raise UserNotFoundError(
-            f"__UNIVERSAL_DATA_FOR_REHYDRATION__ blob not found for '@{username}'. "
-            "The account may not exist, or TikTok served a bot-challenge page."
+            f"{context}: TikTok reports user not found (statusCode={status})."
         )
 
-    try:
-        udr: dict = json.loads(match.group(1))
-    except json.JSONDecodeError as exc:
-        raise TikTokBlockedError(
-            f"Failed to parse TikTok SSR JSON for '@{username}': {exc}"
-        ) from exc
-
-    # Traverse the known key path.
-    default_scope: dict = udr.get("__DEFAULT_SCOPE__") or {}
-    user_detail: dict = default_scope.get("webapp.user-detail") or {}
-    user_info: dict = user_detail.get("userInfo") or {}
-    user: dict = user_info.get("user") or {}
-    sec_uid: str | None = user.get("secUid")
-
-    if not sec_uid:
+    # Private / banned account
+    if status in (10203, 10204):
         raise UserNotFoundError(
-            f"secUid not found in TikTok SSR data for '@{username}'. "
-            "The account may be private, suspended, or the username is invalid."
+            f"{context}: TikTok account is private or banned (statusCode={status})."
         )
 
-    return sec_uid
+    # Any other non-zero code is treated as a temporary block / unknown error.
+    raise TikTokBlockedError(
+        f"{context}: TikTok returned non-zero statusCode={status}."
+    )
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-async def resolve_sec_uid(username: str, client: httpx.AsyncClient) -> str:
+async def resolve_author_id(username: str, client: httpx.AsyncClient) -> str:
     """
-    Fetch the TikTok profile page and return the user's ``secUid``.
+    Call TikTok's user-detail JSON endpoint and return the numeric ``author_id``.
+
+    Endpoint::
+
+        GET /api/user/detail/?uniqueId={username}&aid=1988
+
+    The response shape is::
+
+        {
+          "statusCode": 0,
+          "userInfo": {
+            "user": {
+              "id": "123456789",      ← what we return
+              "uniqueId": "username",
+              "secUid": "MS4wLjAB...",
+              ...
+            },
+            "stats": { ... }
+          }
+        }
 
     Args:
         username: TikTok username without the leading ``@``.
-        client:   A live ``httpx.AsyncClient`` to reuse for the request.
+        client:   A live ``httpx.AsyncClient`` to reuse.
 
     Returns:
-        The ``secUid`` string (a long opaque identifier used by TikTok's APIs).
+        The numeric ``id`` string (author_id) for the user.
 
     Raises:
-        UserNotFoundError:   Profile page returned 404, or secUid is absent.
-        TikTokBlockedError:  HTTP 403, 429, 5xx, or unparseable response.
+        UserNotFoundError:   User does not exist, is private, or is banned.
+        TikTokBlockedError:  HTTP-level block / rate-limit / server error.
     """
-    url = f"{TIKTOK_BASE}/@{username}"
-    logger.info("resolve_sec_uid: GET %s", url)
+    url = f"{TIKTOK_BASE}{_USER_DETAIL_PATH}"
+    params = {"uniqueId": username, "aid": _AID}
+    headers = {**_BASE_API_HEADERS, "Referer": f"{TIKTOK_BASE}/"}
+
+    logger.info(
+        "resolve_author_id: GET %s?uniqueId=%s", url, username
+    )
 
     try:
-        resp = await client.get(url, headers=_PROFILE_HEADERS)
+        resp = await client.get(url, params=params, headers=headers)
     except httpx.RequestError as exc:
         raise TikTokBlockedError(
-            f"Network error fetching TikTok profile for '@{username}': {exc}"
+            f"resolve_author_id: network error for '@{username}': {exc}"
         ) from exc
 
     logger.debug(
-        "resolve_sec_uid: response  status=%d  url=%s",
+        "resolve_author_id: response  status=%d  username=%r",
         resp.status_code,
-        str(resp.url),
+        username,
     )
 
+    # ── HTTP-level errors ─────────────────────────────────────────────────────
     if resp.status_code == 404:
         raise UserNotFoundError(
-            f"TikTok returned HTTP 404 for '@{username}'. The account does not exist."
+            f"TikTok returned HTTP 404 for user detail of '@{username}'."
         )
     if resp.status_code in (403, 429):
         raise TikTokBlockedError(
-            f"TikTok blocked the profile request for '@{username}' "
+            f"TikTok blocked user-detail request for '@{username}' "
             f"(HTTP {resp.status_code})."
         )
     if resp.status_code >= 500:
         raise TikTokBlockedError(
-            f"TikTok server error while fetching '@{username}' "
+            f"TikTok server error on user-detail for '@{username}' "
             f"(HTTP {resp.status_code})."
         )
     if resp.status_code != 200:
         raise TikTokBlockedError(
-            f"Unexpected HTTP {resp.status_code} from TikTok profile for '@{username}'."
+            f"Unexpected HTTP {resp.status_code} from user-detail "
+            f"for '@{username}'."
         )
 
-    sec_uid = _parse_sec_uid_from_html(resp.text, username)
+    # ── Parse JSON ────────────────────────────────────────────────────────────
+    try:
+        body: dict = resp.json()
+    except Exception as exc:
+        raise TikTokBlockedError(
+            f"resolve_author_id: non-JSON response for '@{username}': {exc}"
+        ) from exc
+
+    # ── TikTok internal status code ───────────────────────────────────────────
+    _check_tiktok_status(body, f"resolve_author_id('@{username}')")
+
+    # ── Extract author_id ─────────────────────────────────────────────────────
+    user_info: dict = body.get("userInfo") or {}
+    user: dict = user_info.get("user") or {}
+    author_id: str | None = user.get("id")
+
+    if not author_id:
+        raise UserNotFoundError(
+            f"resolve_author_id: 'id' field missing in TikTok user-detail "
+            f"response for '@{username}'. "
+            "The account may not exist or may be inaccessible."
+        )
+
     logger.info(
-        "resolve_sec_uid: resolved  username=%r  secUid=%s…",
+        "resolve_author_id: resolved  username=%r  author_id=%s",
         username,
-        sec_uid[:24],
+        author_id,
     )
-    return sec_uid
+    return author_id
 
 
 async def fetch_stories_for_user(username: str) -> dict:
     """
-    Full pipeline: resolve ``secUid`` → fetch and paginate the story API.
+    Full pipeline: resolve ``author_id`` → fetch and paginate the story API.
 
-    Opens a single ``httpx.AsyncClient``, reuses it for both the profile page
-    and all story API pages (connection pooling, shared TLS session).
+    Opens a single ``httpx.AsyncClient`` and reuses it for both the user-detail
+    call and all story-API pages (connection pooling, shared TLS session).
+
+    Endpoint::
+
+        GET /api/story/item_list/?author_id={author_id}&count=30
+                                  &cursor={cursor}&aid=1988
 
     Args:
         username: TikTok username without the leading ``@``.
@@ -252,17 +269,18 @@ async def fetch_stories_for_user(username: str) -> dict:
             }
 
     Raises:
-        UserNotFoundError:   User does not exist or secUid cannot be resolved.
+        UserNotFoundError:    User does not exist or author_id cannot be resolved.
         StoriesNotFoundError: User exists but has no active stories.
-        TikTokBlockedError:  TikTok rate-limited or blocked the request.
+        TikTokBlockedError:   TikTok rate-limited or blocked the request.
     """
     async with _make_client() as client:
-        # ── Step 1: resolve secUid ────────────────────────────────────────────
-        sec_uid = await resolve_sec_uid(username, client)
+        # ── Step 1: resolve author_id ─────────────────────────────────────────
+        author_id = await resolve_author_id(username, client)
 
-        # ── Step 2: paginate the story API ───────────────────────────────────
+        # ── Step 2: paginate the story API ────────────────────────────────────
         story_url = f"{TIKTOK_BASE}{_STORY_API_PATH}"
         referer = f"{TIKTOK_BASE}/@{username}"
+        story_headers = {**_BASE_API_HEADERS, "Referer": referer}
 
         all_items: list[dict] = []
         envelope: dict | None = None
@@ -272,12 +290,11 @@ async def fetch_stories_for_user(username: str) -> dict:
 
         while has_more:
             params: dict[str, str] = {
-                "secUid": sec_uid,
+                "author_id": author_id,
                 "count": "30",
                 "cursor": str(cursor),
+                "aid": _AID,
             }
-
-            api_headers = {**_STORY_API_HEADERS, "Referer": referer}
 
             logger.info(
                 "fetch_stories_for_user: page %d  cursor=%s  username=%r",
@@ -287,10 +304,13 @@ async def fetch_stories_for_user(username: str) -> dict:
             )
 
             try:
-                resp = await client.get(story_url, params=params, headers=api_headers)
+                resp = await client.get(
+                    story_url, params=params, headers=story_headers
+                )
             except httpx.RequestError as exc:
                 raise TikTokBlockedError(
-                    f"Network error fetching story page {page_num} for '@{username}': {exc}"
+                    f"fetch_stories_for_user: network error on page {page_num} "
+                    f"for '@{username}': {exc}"
                 ) from exc
 
             logger.debug(
@@ -299,9 +319,10 @@ async def fetch_stories_for_user(username: str) -> dict:
                 page_num,
             )
 
+            # ── HTTP-level errors ─────────────────────────────────────────────
             if resp.status_code in (403, 429):
                 raise TikTokBlockedError(
-                    f"TikTok blocked story API request for '@{username}' "
+                    f"TikTok blocked story API for '@{username}' "
                     f"(HTTP {resp.status_code})."
                 )
             if resp.status_code >= 500:
@@ -315,14 +336,21 @@ async def fetch_stories_for_user(username: str) -> dict:
                     f"for '@{username}'."
                 )
 
+            # ── Parse JSON ────────────────────────────────────────────────────
             try:
                 body: dict = resp.json()
             except Exception as exc:
                 raise TikTokBlockedError(
-                    f"Story API returned non-JSON on page {page_num}: {exc}"
+                    f"fetch_stories_for_user: non-JSON response on page "
+                    f"{page_num} for '@{username}': {exc}"
                 ) from exc
 
-            # Accumulate items from this page.
+            # ── TikTok internal status code ───────────────────────────────────
+            _check_tiktok_status(
+                body, f"fetch_stories_for_user('@{username}') page {page_num}"
+            )
+
+            # ── Accumulate items ──────────────────────────────────────────────
             page_items: list[dict] = body.get("itemList") or []
             all_items.extend(page_items)
 
@@ -330,9 +358,8 @@ async def fetch_stories_for_user(username: str) -> dict:
             cursor = body.get("cursor") or body.get("minCursor") or 0
             has_more = bool(body.get("has_more") or body.get("hasMore"))
 
-            # Save envelope metadata (everything except itemList) for the final
-            # merged response.  We overwrite on each page so the envelope always
-            # reflects the last page's metadata (status_code, etc.).
+            # Save envelope metadata (everything except itemList) so the final
+            # merged response looks like one complete API page.
             envelope = {k: v for k, v in body.items() if k != "itemList"}
 
             logger.info(
@@ -351,11 +378,11 @@ async def fetch_stories_for_user(username: str) -> dict:
             # itemList at the real end of the list.
             if not page_items:
                 logger.info(
-                    "fetch_stories_for_user: empty page — stopping pagination"
+                    "fetch_stories_for_user: empty page received — stopping pagination"
                 )
                 break
 
-        # ── Step 3: validate & merge ─────────────────────────────────────────
+        # ── Step 3: validate & merge ──────────────────────────────────────────
         logger.info(
             "fetch_stories_for_user: pagination complete  username=%r  total_items=%d",
             username,
