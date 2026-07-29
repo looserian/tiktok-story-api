@@ -1,32 +1,41 @@
 """
 tiktok_client.py - Direct async HTTP client for TikTok's internal JSON APIs.
 
-Two-phase approach:
+Architecture
+============
 
-  Phase 1 — resolve_author_id()
-      Primary:  GET https://www.tiktok.com/api/user/detail/?uniqueId={username}&aid=1988
-                with enhanced headers (msToken cookie spoof, full Chrome UA, Referer).
-                Content-Type is inspected before calling .json() — a challenge/HTML
-                page is caught safely and triggers the fallback.
-      Fallback: GET https://www.tiktok.com/@{username} as raw HTML, then parse
-                ``author_id`` / ``secUid`` from embedded <script> JSON via regex.
-      → Returns the numeric ``author_id`` string on success, or raises a typed
-        exception if both tiers fail.
+  resolve_user_credentials(username)   ← new multi-stage resolver
+  ──────────────────────────────────
+  Layer 1 — In-memory TTL cache (24 h)
+      Returns immediately if the username was resolved recently.
 
-  Phase 2 — fetch_stories_for_user()
-      GET https://www.tiktok.com/api/story/item_list/
-          ?author_id={author_id}&count=30&cursor={cursor}&aid=1988
-      → paginate until ``has_more`` is falsy, accumulate all ``itemList``
-        entries, return a merged dict shaped like a single API response page.
+  Layer 2 — JSON user-detail API
+      GET /api/user/detail/?uniqueId={username}&aid=1988
+      Enhanced headers: full Chrome UA, profile-page Referer, spoofed
+      ``ttwid`` + ``msToken`` cookies.  Content-Type is inspected before
+      calling ``.json()`` so an HTML challenge page never crashes the process.
 
-All requests use browser-mimicking headers (User-Agent, Referer,
-Accept-Language) to blend in with organic Chrome traffic.
+  Layer 3 — HTML profile page + RegEx
+      GET https://www.tiktok.com/@{username}  (raw HTML)
+      Four patterns tried in order:
+        "authorId":"(\\d+)"   "userId":"(\\d+)"   "id":"(\\d+)"   "secUid":"([^"]+)"
+
+  Total failure → TikTokBlockedError with a user-friendly message.
+  The exception is caught in scraper.py → fetch_page_info() which returns
+  {"success": false, "error": "...", "status_code": 502} without crashing.
+
+  fetch_stories_for_user(username)
+  ────────────────────────────────
+  Phase 2: paginate /api/story/item_list/ using the resolved author_id.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import time
+from dataclasses import dataclass, field
+from typing import Optional
 
 import httpx
 
@@ -34,50 +43,60 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-TIKTOK_BASE = "https://www.tiktok.com"
+TIKTOK_BASE      = "https://www.tiktok.com"
 _USER_DETAIL_PATH = "/api/user/detail/"
-_STORY_API_PATH = "/api/story/item_list/"
+_STORY_API_PATH   = "/api/story/item_list/"
 
 # TikTok Web app-ID — required parameter on all internal API calls.
 _AID = "1988"
 
-# Chrome 124 on Windows.
+# Chrome 124 on Windows — matches the sec-ch-ua hint values below.
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Base headers shared by every TikTok internal API call.
-# The ``Referer`` key is intentionally absent here — each call sets it
-# individually to the most appropriate value.
-_BASE_API_HEADERS: dict[str, str] = {
-    "User-Agent": _UA,
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-}
-
-# Enhanced user-detail headers: spoof a plausible msToken cookie value and
-# provide the profile page as Referer so the request looks like an XHR made
-# by TikTok's own SPA after a user navigated to a profile.
-_USER_DETAIL_COOKIE = (
+# ── Cookie spoof ──────────────────────────────────────────────────────────────
+# Both ttwid and msToken are required by TikTok's bot-detection layer.
+# These are plausible-looking dummy values; they are not real session tokens
+# but help the request pass surface-level bot filters.
+_SPOOF_TTWID = (
+    "ttwid=1%7CfakeBase64EncodedTTWidValue%7C1700000000%7C"
+    "abcdef1234567890abcdef1234567890abcdef12"
+)
+_SPOOF_MS_TOKEN = (
     "msToken=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
 )
+_SPOOF_COOKIES = f"{_SPOOF_TTWID}; {_SPOOF_MS_TOKEN}"
 
-# Regex patterns used by the HTML fallback to extract identifiers from the
-# server-side rendered JSON embedded in TikTok profile pages.
-_RE_AUTHOR_ID = re.compile(r'"authorId"\s*:\s*"(\d+)"')
-_RE_USER_ID   = re.compile(r'"userId"\s*:\s*"(\d+)"')
-_RE_SEC_UID   = re.compile(r'"secUid"\s*:\s*"([^"]{20,})"')
+# Base headers shared by every TikTok internal API call.
+_BASE_API_HEADERS: dict[str, str] = {
+    "User-Agent":        _UA,
+    "Accept":            "application/json, text/plain, */*",
+    "Accept-Language":   "en-US,en;q=0.9",
+    "Accept-Encoding":   "gzip, deflate, br",
+    "Cache-Control":     "no-cache",
+    "Pragma":            "no-cache",
+    "Sec-Ch-Ua":         '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile":  "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest":    "empty",
+    "Sec-Fetch-Mode":    "cors",
+    "Sec-Fetch-Site":    "same-origin",
+}
+
+# ── Regex patterns for the HTML-profile fallback ──────────────────────────────
+# Applied in order; the first successful match wins.
+_HTML_ID_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r'"authorId"\s*:\s*"(\d+)"'),   # most common in recent SSR layouts
+    re.compile(r'"userId"\s*:\s*"(\d+)"'),      # alternative key name
+    re.compile(r'"id"\s*:\s*"(\d{6,})"'),       # generic numeric id (≥ 6 digits)
+]
+_HTML_SEC_UID_PATTERN = re.compile(r'"secUid"\s*:\s*"([^"]{20,})"')
+
+# Cache TTL in seconds (24 hours).
+_CACHE_TTL_SECONDS = 86_400
 
 
 # ── Typed exceptions ──────────────────────────────────────────────────────────
@@ -92,6 +111,49 @@ class StoriesNotFoundError(Exception):
 
 class TikTokBlockedError(Exception):
     """TikTok returned a blocking, rate-limiting, or server-error response."""
+
+
+# ── In-memory credential cache ────────────────────────────────────────────────
+
+@dataclass
+class _CachedCredentials:
+    """Cached result of a successful username resolution."""
+    author_id: str
+    sec_uid:   str
+    metadata:  dict = field(default_factory=dict)   # raw 'user' dict from TikTok
+    cached_at: float = field(default_factory=time.monotonic)
+
+    def is_fresh(self) -> bool:
+        return (time.monotonic() - self.cached_at) < _CACHE_TTL_SECONDS
+
+
+# username (lowercased) → cached credentials
+_credential_cache: dict[str, _CachedCredentials] = {}
+
+
+def _cache_get(username: str) -> Optional[_CachedCredentials]:
+    """Return a fresh cache entry for *username*, or None."""
+    entry = _credential_cache.get(username.lower())
+    if entry is None:
+        return None
+    if not entry.is_fresh():
+        del _credential_cache[username.lower()]
+        return None
+    return entry
+
+
+def _cache_set(
+    username: str,
+    author_id: str,
+    sec_uid: str,
+    metadata: dict | None = None,
+) -> None:
+    """Store credentials in the in-memory cache."""
+    _credential_cache[username.lower()] = _CachedCredentials(
+        author_id=author_id,
+        sec_uid=sec_uid,
+        metadata=metadata or {},
+    )
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -109,6 +171,18 @@ def _make_client() -> httpx.AsyncClient:
         http2=True,
         follow_redirects=True,
     )
+
+
+def _is_json_content_type(resp: httpx.Response) -> bool:
+    """
+    Return True only when the response Content-Type signals JSON.
+
+    TikTok occasionally serves an HTML security/challenge page with HTTP 200
+    and a ``text/html`` Content-Type instead of the expected JSON payload.
+    Checking Content-Type before calling ``.json()`` prevents a crash.
+    """
+    ct = resp.headers.get("content-type", "").lower()
+    return "application/json" in ct or "text/javascript" in ct
 
 
 def _check_tiktok_status(body: dict, context: str) -> None:
@@ -150,279 +224,296 @@ def _check_tiktok_status(body: dict, context: str) -> None:
     )
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Layer 2: JSON user-detail API ─────────────────────────────────────────────
 
-def _is_json_content_type(resp: httpx.Response) -> bool:
-    """
-    Return True only when the response Content-Type signals JSON.
-
-    TikTok occasionally serves an HTML security/challenge page with HTTP 200
-    and a ``text/html`` Content-Type instead of the expected JSON payload.
-    Checking Content-Type before calling ``.json()`` prevents a crash.
-    """
-    ct = resp.headers.get("content-type", "").lower()
-    return "application/json" in ct or "text/javascript" in ct
-
-
-async def _resolve_via_html_fallback(
+async def _layer2_json_api(
     username: str,
     client: httpx.AsyncClient,
-) -> str:
+) -> tuple[str, str, dict] | None:
     """
-    Fallback: fetch ``https://www.tiktok.com/@{username}`` as raw HTML and
-    extract ``author_id`` (or ``userId``) from the embedded server-side JSON
-    using regular expressions.
+    Query TikTok's hidden user-detail JSON endpoint.
 
-    TikTok's SSR page embeds multiple ``<script>`` blocks that contain the full
-    user JSON.  The ``authorId`` / ``userId`` numeric field is reliably present
-    in at least one of them.
+    Returns ``(author_id, sec_uid, user_dict)`` on success, or ``None`` if the
+    response is not usable (challenge page, bad JSON, etc.).  Raises
+    ``UserNotFoundError`` directly when TikTok confirms the user does not exist
+    (HTTP 404 or statusCode 10201/10202/10203/10204) — there is no value in
+    trying layer 3 for a confirmed-absent user.
+    """
+    url = f"{TIKTOK_BASE}{_USER_DETAIL_PATH}"
+    params = {"uniqueId": username, "aid": _AID}
+    headers = {
+        **_BASE_API_HEADERS,
+        "Referer": f"{TIKTOK_BASE}/@{username}",
+        "Cookie":  _SPOOF_COOKIES,
+    }
 
-    Args:
-        username: TikTok username without the leading ``@``.
-        client:   A live ``httpx.AsyncClient`` to reuse.
+    logger.info("resolve_user_credentials [L2-JSON]: GET %s?uniqueId=%s", url, username)
 
-    Returns:
-        The numeric author_id string.
+    try:
+        resp = await client.get(url, params=params, headers=headers)
+    except httpx.RequestError as exc:
+        logger.warning(
+            "resolve_user_credentials [L2-JSON]: network error for '@%s': %s",
+            username, exc,
+        )
+        return None
 
-    Raises:
-        UserNotFoundError:  Profile page returned 404 or no ID found in HTML.
-        TikTokBlockedError: Network error or non-200/404 HTTP status.
+    logger.debug(
+        "resolve_user_credentials [L2-JSON]: status=%d  content-type=%r  username=%r",
+        resp.status_code,
+        resp.headers.get("content-type", ""),
+        username,
+    )
+
+    # HTTP 404 → user definitely does not exist; propagate immediately.
+    if resp.status_code == 404:
+        raise UserNotFoundError(
+            f"TikTok returned HTTP 404 for user detail of '@{username}'."
+        )
+
+    # Non-200 or non-JSON → challenge/block; fall through to layer 3.
+    if resp.status_code != 200 or not _is_json_content_type(resp):
+        logger.warning(
+            "resolve_user_credentials [L2-JSON]: non-JSON/non-200 for '@%s' "
+            "(status=%d  content-type=%r).  Raw preview: %r",
+            username,
+            resp.status_code,
+            resp.headers.get("content-type", ""),
+            resp.text[:400].replace("\n", " "),
+        )
+        return None
+
+    # Parse JSON safely.
+    try:
+        body: dict = resp.json()
+    except Exception as json_exc:
+        logger.warning(
+            "resolve_user_credentials [L2-JSON]: JSON decode failed for '@%s': %s.  "
+            "Raw preview: %r",
+            username, json_exc,
+            resp.text[:400].replace("\n", " "),
+        )
+        return None
+
+    # TikTok internal status code.
+    try:
+        _check_tiktok_status(body, f"resolve_user_credentials/L2('@{username}')")
+    except UserNotFoundError:
+        raise  # confirmed not found — no point in trying HTML
+    except TikTokBlockedError as exc:
+        logger.warning(
+            "resolve_user_credentials [L2-JSON]: status-code block for '@%s': %s",
+            username, exc,
+        )
+        return None
+
+    # Extract fields.
+    user_info: dict = body.get("userInfo") or {}
+    user: dict      = user_info.get("user") or {}
+    author_id: str | None = user.get("id")
+    sec_uid:   str | None = user.get("secUid")
+
+    if not author_id:
+        logger.warning(
+            "resolve_user_credentials [L2-JSON]: 'id' field missing for '@%s'.",
+            username,
+        )
+        return None
+
+    logger.info(
+        "resolve_user_credentials [L2-JSON]: resolved  username=%r  "
+        "author_id=%s  sec_uid=%s",
+        username, author_id, (sec_uid or "")[:20] + "…" if sec_uid else "",
+    )
+    return author_id, sec_uid or "", user
+
+
+# ── Layer 3: HTML profile page + RegEx ───────────────────────────────────────
+
+async def _layer3_html_regex(
+    username: str,
+    client: httpx.AsyncClient,
+) -> tuple[str, str, dict] | None:
+    """
+    Fetch ``https://www.tiktok.com/@{username}`` and extract identifiers
+    from TikTok's server-side-rendered JSON embedded in ``<script>`` tags.
+
+    Returns ``(author_id, sec_uid, {})`` on success, ``None`` if no ID is found.
+    Raises ``UserNotFoundError`` on HTTP 404.
     """
     profile_url = f"{TIKTOK_BASE}/@{username}"
-    html_headers = {
+    headers = {
         **_BASE_API_HEADERS,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": TIKTOK_BASE + "/",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
+        "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer":                  TIKTOK_BASE + "/",
+        "Sec-Fetch-Dest":           "document",
+        "Sec-Fetch-Mode":           "navigate",
+        "Sec-Fetch-Site":           "none",
         "Upgrade-Insecure-Requests": "1",
     }
 
-    logger.info(
-        "resolve_author_id [HTML fallback]: GET %s", profile_url
-    )
+    logger.info("resolve_user_credentials [L3-HTML]: GET %s", profile_url)
 
     try:
-        resp = await client.get(profile_url, headers=html_headers)
+        resp = await client.get(profile_url, headers=headers)
     except httpx.RequestError as exc:
-        raise TikTokBlockedError(
-            f"resolve_author_id HTML fallback: network error for '@{username}': {exc}"
-        ) from exc
+        logger.warning(
+            "resolve_user_credentials [L3-HTML]: network error for '@%s': %s",
+            username, exc,
+        )
+        return None
 
     logger.debug(
-        "resolve_author_id [HTML fallback]: status=%d  username=%r",
-        resp.status_code,
-        username,
+        "resolve_user_credentials [L3-HTML]: status=%d  username=%r",
+        resp.status_code, username,
     )
 
     if resp.status_code == 404:
         raise UserNotFoundError(
             f"TikTok profile page returned HTTP 404 for '@{username}'."
         )
+
     if resp.status_code != 200:
-        raise TikTokBlockedError(
-            f"resolve_author_id HTML fallback: unexpected HTTP {resp.status_code} "
-            f"for '@{username}'."
+        logger.warning(
+            "resolve_user_credentials [L3-HTML]: unexpected HTTP %d for '@%s'.  "
+            "Raw preview: %r",
+            resp.status_code, username,
+            resp.text[:400].replace("\n", " "),
         )
+        return None
 
     html = resp.text
 
-    # Try authorId first (most common in newer page layouts), then userId.
-    for pattern in (_RE_AUTHOR_ID, _RE_USER_ID):
+    # ── Try each ID pattern in order ─────────────────────────────────────────
+    author_id: str | None = None
+    for pattern in _HTML_ID_PATTERNS:
         match = pattern.search(html)
         if match:
             author_id = match.group(1)
             logger.info(
-                "resolve_author_id [HTML fallback]: found  username=%r  author_id=%s",
-                username,
-                author_id,
+                "resolve_user_credentials [L3-HTML]: found author_id=%s "
+                "via pattern %r  username=%r",
+                author_id, pattern.pattern, username,
             )
-            return author_id
+            break
 
-    # Log a snippet to help debug future page-layout changes.
-    snippet = html[:500].replace("\n", " ")
-    logger.warning(
-        "resolve_author_id [HTML fallback]: no author_id in HTML  "
-        "username=%r  snippet=%r",
-        username,
-        snippet,
-    )
-    raise UserNotFoundError(
-        f"resolve_author_id: could not extract author_id from TikTok profile page "
-        f"for '@{username}'. The account may be private or the page layout changed."
-    )
+    if not author_id:
+        snippet = html[:600].replace("\n", " ")
+        logger.warning(
+            "resolve_user_credentials [L3-HTML]: no author_id found in HTML  "
+            "username=%r  snippet=%r",
+            username, snippet,
+        )
+        return None
+
+    # ── Try to extract secUid too (best-effort) ───────────────────────────────
+    sec_uid = ""
+    sec_uid_match = _HTML_SEC_UID_PATTERN.search(html)
+    if sec_uid_match:
+        sec_uid = sec_uid_match.group(1)
+        logger.info(
+            "resolve_user_credentials [L3-HTML]: found sec_uid  username=%r  "
+            "sec_uid=%s…",
+            username, sec_uid[:20],
+        )
+
+    return author_id, sec_uid, {}
 
 
-async def resolve_author_id(username: str, client: httpx.AsyncClient) -> str:
+# ── Public multi-stage resolver ───────────────────────────────────────────────
+
+async def resolve_user_credentials(
+    username: str,
+    client: httpx.AsyncClient,
+) -> tuple[str, str]:
     """
-    Resolve a TikTok username to its numeric ``author_id`` using a 2-tier strategy.
+    Resolve *username* → ``(author_id, sec_uid)`` using a 3-layer strategy.
 
-    Tier 1 — JSON API (primary)
-    ---------------------------
-    GET /api/user/detail/?uniqueId={username}&aid=1988
+    Layer 1 — In-memory TTL cache (24 h)
+        Returns immediately if the username was successfully resolved recently,
+        eliminating redundant HTTP requests for the same user.
 
-    Enhanced headers are sent (``msToken`` cookie spoof, profile-page Referer)
-    to reduce the chance of receiving a challenge page.  Before calling
-    ``.json()``, the response Content-Type is inspected: if TikTok returned
-    HTML (challenge / CAPTCHA page) instead of JSON, the tier-1 attempt is
-    abandoned and tier 2 is tried immediately.
+    Layer 2 — JSON user-detail API
+        GET /api/user/detail/?uniqueId={username}&aid=1988
+        Sends spoofed ``ttwid`` + ``msToken`` cookies and a profile-page
+        Referer so the request looks like a legitimate SPA XHR.  Content-Type
+        is checked before parsing to handle HTML challenge pages gracefully.
 
-    Tier 2 — HTML regex fallback
-    ----------------------------
-    GET https://www.tiktok.com/@{username}  (raw HTML)
+    Layer 3 — HTML profile + RegEx
+        GET https://www.tiktok.com/@{username}
+        Four regex patterns are tried in priority order so minor page-layout
+        changes are absorbed without a code update.
 
-    The ``authorId`` / ``userId`` numeric field is extracted directly from the
-    server-side rendered JSON embedded in the page's ``<script>`` blocks.
-
-    On success the numeric ``id`` string is returned.  If both tiers fail a
-    typed exception is raised so the caller can surface the right HTTP status
-    code and a human-readable error message.
-
-    Response shape (tier 1 success)::
-
-        {
-          "statusCode": 0,
-          "userInfo": {
-            "user": {
-              "id": "123456789",      ← returned
-              "uniqueId": "username",
-              "secUid": "MS4wLjAB...",
-              ...
-            },
-            "stats": { ... }
-          }
-        }
+    On success the resolved ``(author_id, sec_uid)`` is written to the cache
+    before returning.
 
     Args:
         username: TikTok username without the leading ``@``.
         client:   A live ``httpx.AsyncClient`` to reuse.
 
     Returns:
-        The numeric ``id`` string (author_id) for the user.
+        ``(author_id, sec_uid)`` — both are strings.  ``sec_uid`` may be an
+        empty string if the HTML fallback succeeded but the secUid regex did
+        not match.
 
     Raises:
         UserNotFoundError:   User does not exist, is private, or is banned.
-        TikTokBlockedError:  Both tiers failed due to rate-limiting / blocking.
+        TikTokBlockedError:  All layers failed (anti-bot active / IP throttled).
     """
-    url = f"{TIKTOK_BASE}{_USER_DETAIL_PATH}"
-    params = {"uniqueId": username, "aid": _AID}
+    key = username.lower()
 
-    # ── Tier 1: JSON API ──────────────────────────────────────────────────────
-    # Use enhanced headers to look like a legitimate XHR from TikTok's SPA:
-    #   • Referer set to the user's own profile page (most natural origin).
-    #   • A plausible msToken cookie value to reduce bot-detection scores.
-    tier1_headers = {
-        **_BASE_API_HEADERS,
-        "Referer": f"{TIKTOK_BASE}/@{username}",
-        "Cookie": _USER_DETAIL_COOKIE,
-    }
-
-    logger.info(
-        "resolve_author_id [tier-1]: GET %s?uniqueId=%s", url, username
-    )
-
-    tier1_failed = False  # set to True if we must fall through to tier 2
-
-    try:
-        resp = await client.get(url, params=params, headers=tier1_headers)
-    except httpx.RequestError as exc:
-        logger.warning(
-            "resolve_author_id [tier-1]: network error for '@%s': %s — trying HTML fallback",
-            username, exc,
-        )
-        tier1_failed = True
-        resp = None  # type: ignore[assignment]
-
-    if resp is not None:
-        logger.debug(
-            "resolve_author_id [tier-1]: status=%d  content-type=%r  username=%r",
-            resp.status_code,
-            resp.headers.get("content-type", ""),
-            username,
-        )
-
-        # ── HTTP-level hard errors → do not fall back, raise immediately ──────
-        if resp.status_code == 404:
-            raise UserNotFoundError(
-                f"TikTok returned HTTP 404 for user detail of '@{username}'."
-            )
-
-        # Non-200 OR non-JSON content-type → fall through to HTML fallback.
-        if resp.status_code != 200 or not _is_json_content_type(resp):
-            raw_preview = resp.text[:300].replace("\n", " ")
-            logger.warning(
-                "resolve_author_id [tier-1]: non-JSON or non-200 response for '@%s' "
-                "(status=%d  content-type=%r) — falling back to HTML.  Preview: %r",
-                username,
-                resp.status_code,
-                resp.headers.get("content-type", ""),
-                raw_preview,
-            )
-            tier1_failed = True
-
-        else:
-            # ── Parse JSON safely ─────────────────────────────────────────────
-            try:
-                body: dict = resp.json()
-            except Exception as json_exc:
-                raw_preview = resp.text[:300].replace("\n", " ")
-                logger.warning(
-                    "resolve_author_id [tier-1]: JSON decode failed for '@%s': %s "
-                    "— falling back to HTML.  Preview: %r",
-                    username, json_exc, raw_preview,
-                )
-                tier1_failed = True
-            else:
-                # ── TikTok internal status code ───────────────────────────────
-                try:
-                    _check_tiktok_status(body, f"resolve_author_id('@{username}')")
-                except UserNotFoundError:
-                    raise  # propagate directly — no point in trying HTML
-                except TikTokBlockedError:
-                    logger.warning(
-                        "resolve_author_id [tier-1]: TikTok status error for '@%s' "
-                        "— falling back to HTML.",
-                        username,
-                    )
-                    tier1_failed = True
-
-                if not tier1_failed:
-                    # ── Extract author_id ─────────────────────────────────────
-                    user_info: dict = body.get("userInfo") or {}
-                    user: dict = user_info.get("user") or {}
-                    author_id: str | None = user.get("id")
-
-                    if not author_id:
-                        logger.warning(
-                            "resolve_author_id [tier-1]: 'id' field missing for '@%s' "
-                            "— falling back to HTML.",
-                            username,
-                        )
-                        tier1_failed = True
-                    else:
-                        logger.info(
-                            "resolve_author_id [tier-1]: resolved  username=%r  author_id=%s",
-                            username, author_id,
-                        )
-                        return author_id
-
-    # ── Tier 2: HTML regex fallback ───────────────────────────────────────────
-    if tier1_failed:
+    # ── Layer 1: in-memory cache ──────────────────────────────────────────────
+    cached = _cache_get(key)
+    if cached is not None:
         logger.info(
-            "resolve_author_id: tier-1 failed for '@%s', attempting HTML fallback.",
-            username,
+            "resolve_user_credentials [L1-cache]: HIT  username=%r  author_id=%s",
+            username, cached.author_id,
         )
-        # _resolve_via_html_fallback raises UserNotFoundError or TikTokBlockedError
-        # on failure, which propagate naturally to the caller.
-        return await _resolve_via_html_fallback(username, client)
+        return cached.author_id, cached.sec_uid
 
-    # Should be unreachable, but satisfies type-checkers.
-    raise TikTokBlockedError(
-        f"resolve_author_id: failed to resolve '@{username}' via any strategy. "
-        "Account may be private or IP throttled."
+    logger.info("resolve_user_credentials [L1-cache]: MISS  username=%r", username)
+
+    # ── Layer 2: JSON API ─────────────────────────────────────────────────────
+    result = await _layer2_json_api(username, client)
+
+    # ── Layer 3: HTML regex (only if layer 2 did not produce a result) ────────
+    if result is None:
+        logger.info(
+            "resolve_user_credentials: L2 failed for '@%s', trying L3 HTML.", username
+        )
+        result = await _layer3_html_regex(username, client)
+
+    # ── Total failure ─────────────────────────────────────────────────────────
+    if result is None:
+        raise TikTokBlockedError(
+            "TikTok anti-bot active. Failed to resolve user profile."
+        )
+
+    author_id, sec_uid, metadata = result
+
+    # Populate cache so the next call for the same user is instant.
+    _cache_set(key, author_id, sec_uid, metadata)
+    logger.info(
+        "resolve_user_credentials: cached  username=%r  author_id=%s", username, author_id
     )
 
+    return author_id, sec_uid
+
+
+# ── Backwards-compatible thin wrapper ────────────────────────────────────────
+
+async def resolve_author_id(username: str, client: httpx.AsyncClient) -> str:
+    """
+    Backwards-compatible wrapper around ``resolve_user_credentials``.
+
+    Returns only the ``author_id`` string.  All internal callers that already
+    use this function continue to work without modification.
+    """
+    author_id, _ = await resolve_user_credentials(username, client)
+    return author_id
+
+
+# ── Story fetcher ─────────────────────────────────────────────────────────────
 
 async def fetch_stories_for_user(username: str) -> dict:
     """
@@ -456,32 +547,30 @@ async def fetch_stories_for_user(username: str) -> dict:
     """
     async with _make_client() as client:
         # ── Step 1: resolve author_id ─────────────────────────────────────────
-        author_id = await resolve_author_id(username, client)
+        author_id, _ = await resolve_user_credentials(username, client)
 
         # ── Step 2: paginate the story API ────────────────────────────────────
-        story_url = f"{TIKTOK_BASE}{_STORY_API_PATH}"
-        referer = f"{TIKTOK_BASE}/@{username}"
+        story_url    = f"{TIKTOK_BASE}{_STORY_API_PATH}"
+        referer      = f"{TIKTOK_BASE}/@{username}"
         story_headers = {**_BASE_API_HEADERS, "Referer": referer}
 
         all_items: list[dict] = []
-        envelope: dict | None = None
-        cursor: int | str = 0
-        has_more: bool = True
-        page_num: int = 1
+        envelope:  dict | None = None
+        cursor:    int | str = 0
+        has_more:  bool = True
+        page_num:  int  = 1
 
         while has_more:
             params: dict[str, str] = {
                 "author_id": author_id,
-                "count": "30",
-                "cursor": str(cursor),
-                "aid": _AID,
+                "count":     "30",
+                "cursor":    str(cursor),
+                "aid":       _AID,
             }
 
             logger.info(
                 "fetch_stories_for_user: page %d  cursor=%s  username=%r",
-                page_num,
-                cursor,
-                username,
+                page_num, cursor, username,
             )
 
             try:
@@ -496,8 +585,7 @@ async def fetch_stories_for_user(username: str) -> dict:
 
             logger.debug(
                 "fetch_stories_for_user: story API response  status=%d  page=%d",
-                resp.status_code,
-                page_num,
+                resp.status_code, page_num,
             )
 
             # ── HTTP-level errors ─────────────────────────────────────────────
@@ -536,7 +624,7 @@ async def fetch_stories_for_user(username: str) -> dict:
             all_items.extend(page_items)
 
             # Update pagination state.
-            cursor = body.get("cursor") or body.get("minCursor") or 0
+            cursor   = body.get("cursor") or body.get("minCursor") or 0
             has_more = bool(body.get("has_more") or body.get("hasMore"))
 
             # Save envelope metadata (everything except itemList) so the final
@@ -546,11 +634,7 @@ async def fetch_stories_for_user(username: str) -> dict:
             logger.info(
                 "fetch_stories_for_user: page %d done  "
                 "page_items=%d  cursor=%s  has_more=%s  total=%d",
-                page_num,
-                len(page_items),
-                cursor,
-                has_more,
-                len(all_items),
+                page_num, len(page_items), cursor, has_more, len(all_items),
             )
 
             page_num += 1
@@ -566,8 +650,7 @@ async def fetch_stories_for_user(username: str) -> dict:
         # ── Step 3: validate & merge ──────────────────────────────────────────
         logger.info(
             "fetch_stories_for_user: pagination complete  username=%r  total_items=%d",
-            username,
-            len(all_items),
+            username, len(all_items),
         )
 
         if not all_items:

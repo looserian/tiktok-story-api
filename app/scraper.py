@@ -91,6 +91,9 @@ async def fetch_page_info(username: str) -> dict:
         return {"success": False, "error": str(exc), "status_code": 404}
 
     except TikTokBlockedError as exc:
+        # Preserve the exact error message raised by the resolver so that the
+        # "TikTok anti-bot active. Failed to resolve user profile." string
+        # (emitted when all 3 layers fail) reaches the n8n caller unchanged.
         logger.warning(
             "fetch_page_info: TikTok blocked  username=%r — %s", username, exc
         )
