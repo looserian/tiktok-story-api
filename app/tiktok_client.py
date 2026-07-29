@@ -71,11 +71,16 @@ _SPOOF_MS_TOKEN = (
 _SPOOF_COOKIES = f"{_SPOOF_TTWID}; {_SPOOF_MS_TOKEN}"
 
 # Base headers shared by every TikTok internal API call.
+# NOTE: Accept-Encoding is intentionally OMITTED here.
+# httpx automatically adds "Accept-Encoding: gzip, br" and decompresses the
+# response body before exposing resp.text / resp.json().  If we set the header
+# manually, httpx still tries to decompress but the round-trip can produce
+# binary artifacts (\x00\x00…) when the server uses Brotli — so we let httpx
+# own the header end-to-end.
 _BASE_API_HEADERS: dict[str, str] = {
     "User-Agent":        _UA,
     "Accept":            "application/json, text/plain, */*",
     "Accept-Language":   "en-US,en;q=0.9",
-    "Accept-Encoding":   "gzip, deflate, br",
     "Cache-Control":     "no-cache",
     "Pragma":            "no-cache",
     "Sec-Ch-Ua":         '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
@@ -84,6 +89,23 @@ _BASE_API_HEADERS: dict[str, str] = {
     "Sec-Fetch-Dest":    "empty",
     "Sec-Fetch-Mode":    "cors",
     "Sec-Fetch-Site":    "same-origin",
+}
+
+# Separate headers for HTML navigation requests (profile page fetches).
+# Accept is overridden to match what a browser sends for a document request.
+_BASE_HTML_HEADERS: dict[str, str] = {
+    "User-Agent":                _UA,
+    "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language":           "en-US,en;q=0.9",
+    "Cache-Control":             "no-cache",
+    "Pragma":                    "no-cache",
+    "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile":          "?0",
+    "Sec-Ch-Ua-Platform":        '"Windows"',
+    "Sec-Fetch-Dest":            "document",
+    "Sec-Fetch-Mode":            "navigate",
+    "Sec-Fetch-Site":            "none",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # ── Regex patterns for the HTML-profile fallback ──────────────────────────────
@@ -340,17 +362,15 @@ async def _layer3_html_regex(
 
     Returns ``(author_id, sec_uid, {})`` on success, ``None`` if no ID is found.
     Raises ``UserNotFoundError`` on HTTP 404.
+
+    Uses ``resp.text`` (not ``resp.content``) so httpx's automatic decompression
+    converts the raw gzip/Brotli bytes to a proper Unicode string before regex
+    matching — binary artifacts like ``\x00\x00`` are never seen by the patterns.
     """
     profile_url = f"{TIKTOK_BASE}/@{username}"
-    headers = {
-        **_BASE_API_HEADERS,
-        "Accept":                   "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer":                  TIKTOK_BASE + "/",
-        "Sec-Fetch-Dest":           "document",
-        "Sec-Fetch-Mode":           "navigate",
-        "Sec-Fetch-Site":           "none",
-        "Upgrade-Insecure-Requests": "1",
-    }
+    # _BASE_HTML_HEADERS already has the right Accept / Sec-Fetch-Dest values
+    # for a browser navigation request.  Add the home-page Referer on top.
+    headers = {**_BASE_HTML_HEADERS, "Referer": TIKTOK_BASE + "/"}
 
     logger.info("resolve_user_credentials [L3-HTML]: GET %s", profile_url)
 
@@ -511,6 +531,136 @@ async def resolve_author_id(username: str, client: httpx.AsyncClient) -> str:
     """
     author_id, _ = await resolve_user_credentials(username, client)
     return author_id
+
+
+# ── Direct story fetcher (author_id already known) ────────────────────────────
+
+async def fetch_tiktok_stories_direct(author_id: str) -> dict:
+    """
+    Paginate ``/api/story/item_list/`` when the caller already has a numeric
+    ``author_id`` and wants to skip the username-resolution step entirely.
+
+    This is the fast path used by the ``/stories`` route when the client
+    supplies ``?author_id=<id>`` directly (e.g. from a cached n8n variable).
+
+    Endpoint::
+
+        GET /api/story/item_list/?author_id={author_id}&count=30
+                                  &cursor={cursor}&aid=1988
+
+    Args:
+        author_id: Numeric TikTok author_id string (e.g. ``"6797910539677074437"``).
+
+    Returns:
+        Same merged dict as ``fetch_stories_for_user`` —
+        ``{"itemList": [...], ...}``.
+
+    Raises:
+        StoriesNotFoundError: No active stories for this author_id.
+        TikTokBlockedError:   TikTok rate-limited or blocked the request.
+    """
+    story_url     = f"{TIKTOK_BASE}{_STORY_API_PATH}"
+    story_headers = {**_BASE_API_HEADERS, "Referer": TIKTOK_BASE + "/"}
+
+    all_items: list[dict] = []
+    envelope:  dict | None = None
+    cursor:    int | str = 0
+    has_more:  bool = True
+    page_num:  int  = 1
+
+    async with _make_client() as client:
+        while has_more:
+            params: dict[str, str] = {
+                "author_id": author_id,
+                "count":     "30",
+                "cursor":    str(cursor),
+                "aid":       _AID,
+            }
+
+            logger.info(
+                "fetch_tiktok_stories_direct: page %d  cursor=%s  author_id=%s",
+                page_num, cursor, author_id,
+            )
+
+            try:
+                resp = await client.get(
+                    story_url, params=params, headers=story_headers
+                )
+            except httpx.RequestError as exc:
+                raise TikTokBlockedError(
+                    f"fetch_tiktok_stories_direct: network error on page {page_num} "
+                    f"for author_id={author_id!r}: {exc}"
+                ) from exc
+
+            logger.debug(
+                "fetch_tiktok_stories_direct: response  status=%d  page=%d",
+                resp.status_code, page_num,
+            )
+
+            if resp.status_code in (403, 429):
+                raise TikTokBlockedError(
+                    f"TikTok blocked story API for author_id={author_id!r} "
+                    f"(HTTP {resp.status_code})."
+                )
+            if resp.status_code >= 500:
+                raise TikTokBlockedError(
+                    f"TikTok story API server error for author_id={author_id!r} "
+                    f"(HTTP {resp.status_code})."
+                )
+            if resp.status_code != 200:
+                raise TikTokBlockedError(
+                    f"Unexpected HTTP {resp.status_code} from story API "
+                    f"for author_id={author_id!r}."
+                )
+
+            try:
+                body: dict = resp.json()
+            except Exception as exc:
+                raise TikTokBlockedError(
+                    f"fetch_tiktok_stories_direct: non-JSON response on page "
+                    f"{page_num} for author_id={author_id!r}: {exc}"
+                ) from exc
+
+            _check_tiktok_status(
+                body, f"fetch_tiktok_stories_direct(author_id={author_id!r}) page {page_num}"
+            )
+
+            page_items: list[dict] = body.get("itemList") or []
+            all_items.extend(page_items)
+
+            cursor   = body.get("cursor") or body.get("minCursor") or 0
+            has_more = bool(body.get("has_more") or body.get("hasMore"))
+            envelope = {k: v for k, v in body.items() if k != "itemList"}
+
+            logger.info(
+                "fetch_tiktok_stories_direct: page %d done  "
+                "page_items=%d  cursor=%s  has_more=%s  total=%d",
+                page_num, len(page_items), cursor, has_more, len(all_items),
+            )
+
+            page_num += 1
+
+            if not page_items:
+                logger.info(
+                    "fetch_tiktok_stories_direct: empty page — stopping pagination"
+                )
+                break
+
+    logger.info(
+        "fetch_tiktok_stories_direct: done  author_id=%s  total_items=%d",
+        author_id, len(all_items),
+    )
+
+    if not all_items:
+        raise StoriesNotFoundError(
+            f"No active stories found for author_id={author_id!r}."
+        )
+
+    merged: dict = {}
+    if envelope:
+        merged.update(envelope)
+    merged["itemList"] = all_items
+    return merged
 
 
 # ── Story fetcher ─────────────────────────────────────────────────────────────

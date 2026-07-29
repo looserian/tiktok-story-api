@@ -24,6 +24,12 @@ from app.models import (
     RootResponse,
 )
 from app.scraper import fetch_page_info, download_story_media
+from app.tiktok_client import (
+    StoriesNotFoundError,
+    TikTokBlockedError,
+    UserNotFoundError,
+    fetch_tiktok_stories_direct,
+)
 from app.utils.parser import parse_story_response
 from app.utils.story_store import get_last_story_id, set_last_story_id
 
@@ -142,9 +148,22 @@ async def get_stories(
         min_length=1,
         max_length=64,
     ),
+    author_id: str | None = Query(
+        default=None,
+        description=(
+            "Optional: known numeric TikTok author_id (e.g. '6797910539677074437'). "
+            "When supplied, username resolution is skipped entirely and stories are "
+            "fetched directly — faster and immune to anti-bot challenges."
+        ),
+        examples=["6797910539677074437"],
+    ),
 ) -> ParsedStoriesResponse:
     """
     Protected endpoint — fetches and parses TikTok stories for *username*.
+
+    If ``author_id`` is provided in the query string, the username-resolution
+    step is bypassed completely and stories are fetched directly from the
+    story API — this path is immune to profile-page anti-bot challenges.
 
     Error conditions returned as structured JSON:
 
@@ -155,11 +174,46 @@ async def get_stories(
     | 502  | TikTok blocked the request or the browser failed |
     | 500  | Unexpected internal error |
     """
+    # ── Fast path: author_id supplied ─────────────────────────────────────────
+    if author_id:
+        logger.info(
+            "get_stories: direct mode  username=%r  author_id=%s", username, author_id
+        )
+        try:
+            story_json = await fetch_tiktok_stories_direct(author_id)
+        except StoriesNotFoundError as exc:
+            logger.info("get_stories: no stories (direct)  author_id=%s", author_id)
+            raise HTTPException(
+                status_code=404,
+                detail={"success": False, "error": str(exc)},
+            ) from exc
+        except (TikTokBlockedError, UserNotFoundError) as exc:
+            logger.warning(
+                "get_stories: direct fetch failed  author_id=%s  error=%s", author_id, exc
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={"success": False, "error": str(exc)},
+            ) from exc
+
+        parsed = parse_story_response(story_json)
+        if not parsed.get("stories"):
+            raise HTTPException(
+                status_code=404,
+                detail={"success": False, "error": "No active stories found for this author."},
+            )
+        logger.info(
+            "get_stories: done (direct)  author_id=%s  story_count=%d",
+            author_id, parsed.get("story_count", 0),
+        )
+        return ParsedStoriesResponse(**parsed)
+
+    # ── Normal path: resolve via username ─────────────────────────────────────
     logger.info("get_stories: starting  username=%r", username)
 
     result = await fetch_page_info(username)
 
-    # ── Fetch failure (user not found, no stories, TikTok blocked) ───────────
+    # ── Fetch failure (user not found, no stories, TikTok blocked) ──────────
     if not result.get("success"):
         error_msg = result.get("error", "TikTok request failed.")
         http_status: int = result.get("status_code", 502)
@@ -174,7 +228,7 @@ async def get_stories(
             detail={"success": False, "error": error_msg},
         )
 
-    # ── Safety guard: story_json should always be present on success ──────────
+    # ── Safety guard: story_json should always be present on success ────────
     story_json: dict | None = result.get("story_json")
     if story_json is None:
         logger.warning("get_stories: story_json missing despite success=True  username=%r", username)
@@ -189,7 +243,7 @@ async def get_stories(
             },
         )
 
-    # ── Parse and return ──────────────────────────────────────────────────────
+    # ── Parse and return ────────────────────────────────────────────────
     parsed = parse_story_response(story_json)
 
     # Extra guard: if parser returned empty stories, surface a 404.
