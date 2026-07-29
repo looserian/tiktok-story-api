@@ -1,14 +1,17 @@
 """
 tiktok_client.py - Direct async HTTP client for TikTok's internal JSON APIs.
 
-Two-phase approach, both phases use plain JSON GET requests — no HTML
-parsing, no regex, no browser automation:
+Two-phase approach:
 
   Phase 1 — resolve_author_id()
-      GET https://www.tiktok.com/api/user/detail/?uniqueId={username}&aid=1988
-      → extract the numeric ``author_id`` from TikTok's user-detail endpoint.
-        Fails fast with a typed exception if the user is not found or the
-        request is blocked before any story fetch is attempted.
+      Primary:  GET https://www.tiktok.com/api/user/detail/?uniqueId={username}&aid=1988
+                with enhanced headers (msToken cookie spoof, full Chrome UA, Referer).
+                Content-Type is inspected before calling .json() — a challenge/HTML
+                page is caught safely and triggers the fallback.
+      Fallback: GET https://www.tiktok.com/@{username} as raw HTML, then parse
+                ``author_id`` / ``secUid`` from embedded <script> JSON via regex.
+      → Returns the numeric ``author_id`` string on success, or raises a typed
+        exception if both tiers fail.
 
   Phase 2 — fetch_stories_for_user()
       GET https://www.tiktok.com/api/story/item_list/
@@ -17,13 +20,13 @@ parsing, no regex, no browser automation:
         entries, return a merged dict shaped like a single API response page.
 
 All requests use browser-mimicking headers (User-Agent, Referer,
-Accept-Language) to blend in with organic Chrome traffic.  No cookies or
-authentication tokens are sent, keeping every request 100 % anonymous.
+Accept-Language) to blend in with organic Chrome traffic.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 
 import httpx
 
@@ -62,6 +65,19 @@ _BASE_API_HEADERS: dict[str, str] = {
     "Sec-Fetch-Mode": "cors",
     "Sec-Fetch-Site": "same-origin",
 }
+
+# Enhanced user-detail headers: spoof a plausible msToken cookie value and
+# provide the profile page as Referer so the request looks like an XHR made
+# by TikTok's own SPA after a user navigated to a profile.
+_USER_DETAIL_COOKIE = (
+    "msToken=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
+)
+
+# Regex patterns used by the HTML fallback to extract identifiers from the
+# server-side rendered JSON embedded in TikTok profile pages.
+_RE_AUTHOR_ID = re.compile(r'"authorId"\s*:\s*"(\d+)"')
+_RE_USER_ID   = re.compile(r'"userId"\s*:\s*"(\d+)"')
+_RE_SEC_UID   = re.compile(r'"secUid"\s*:\s*"([^"]{20,})"')
 
 
 # ── Typed exceptions ──────────────────────────────────────────────────────────
@@ -136,21 +152,140 @@ def _check_tiktok_status(body: dict, context: str) -> None:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _is_json_content_type(resp: httpx.Response) -> bool:
+    """
+    Return True only when the response Content-Type signals JSON.
+
+    TikTok occasionally serves an HTML security/challenge page with HTTP 200
+    and a ``text/html`` Content-Type instead of the expected JSON payload.
+    Checking Content-Type before calling ``.json()`` prevents a crash.
+    """
+    ct = resp.headers.get("content-type", "").lower()
+    return "application/json" in ct or "text/javascript" in ct
+
+
+async def _resolve_via_html_fallback(
+    username: str,
+    client: httpx.AsyncClient,
+) -> str:
+    """
+    Fallback: fetch ``https://www.tiktok.com/@{username}`` as raw HTML and
+    extract ``author_id`` (or ``userId``) from the embedded server-side JSON
+    using regular expressions.
+
+    TikTok's SSR page embeds multiple ``<script>`` blocks that contain the full
+    user JSON.  The ``authorId`` / ``userId`` numeric field is reliably present
+    in at least one of them.
+
+    Args:
+        username: TikTok username without the leading ``@``.
+        client:   A live ``httpx.AsyncClient`` to reuse.
+
+    Returns:
+        The numeric author_id string.
+
+    Raises:
+        UserNotFoundError:  Profile page returned 404 or no ID found in HTML.
+        TikTokBlockedError: Network error or non-200/404 HTTP status.
+    """
+    profile_url = f"{TIKTOK_BASE}/@{username}"
+    html_headers = {
+        **_BASE_API_HEADERS,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": TIKTOK_BASE + "/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    logger.info(
+        "resolve_author_id [HTML fallback]: GET %s", profile_url
+    )
+
+    try:
+        resp = await client.get(profile_url, headers=html_headers)
+    except httpx.RequestError as exc:
+        raise TikTokBlockedError(
+            f"resolve_author_id HTML fallback: network error for '@{username}': {exc}"
+        ) from exc
+
+    logger.debug(
+        "resolve_author_id [HTML fallback]: status=%d  username=%r",
+        resp.status_code,
+        username,
+    )
+
+    if resp.status_code == 404:
+        raise UserNotFoundError(
+            f"TikTok profile page returned HTTP 404 for '@{username}'."
+        )
+    if resp.status_code != 200:
+        raise TikTokBlockedError(
+            f"resolve_author_id HTML fallback: unexpected HTTP {resp.status_code} "
+            f"for '@{username}'."
+        )
+
+    html = resp.text
+
+    # Try authorId first (most common in newer page layouts), then userId.
+    for pattern in (_RE_AUTHOR_ID, _RE_USER_ID):
+        match = pattern.search(html)
+        if match:
+            author_id = match.group(1)
+            logger.info(
+                "resolve_author_id [HTML fallback]: found  username=%r  author_id=%s",
+                username,
+                author_id,
+            )
+            return author_id
+
+    # Log a snippet to help debug future page-layout changes.
+    snippet = html[:500].replace("\n", " ")
+    logger.warning(
+        "resolve_author_id [HTML fallback]: no author_id in HTML  "
+        "username=%r  snippet=%r",
+        username,
+        snippet,
+    )
+    raise UserNotFoundError(
+        f"resolve_author_id: could not extract author_id from TikTok profile page "
+        f"for '@{username}'. The account may be private or the page layout changed."
+    )
+
+
 async def resolve_author_id(username: str, client: httpx.AsyncClient) -> str:
     """
-    Call TikTok's user-detail JSON endpoint and return the numeric ``author_id``.
+    Resolve a TikTok username to its numeric ``author_id`` using a 2-tier strategy.
 
-    Endpoint::
+    Tier 1 — JSON API (primary)
+    ---------------------------
+    GET /api/user/detail/?uniqueId={username}&aid=1988
 
-        GET /api/user/detail/?uniqueId={username}&aid=1988
+    Enhanced headers are sent (``msToken`` cookie spoof, profile-page Referer)
+    to reduce the chance of receiving a challenge page.  Before calling
+    ``.json()``, the response Content-Type is inspected: if TikTok returned
+    HTML (challenge / CAPTCHA page) instead of JSON, the tier-1 attempt is
+    abandoned and tier 2 is tried immediately.
 
-    The response shape is::
+    Tier 2 — HTML regex fallback
+    ----------------------------
+    GET https://www.tiktok.com/@{username}  (raw HTML)
+
+    The ``authorId`` / ``userId`` numeric field is extracted directly from the
+    server-side rendered JSON embedded in the page's ``<script>`` blocks.
+
+    On success the numeric ``id`` string is returned.  If both tiers fail a
+    typed exception is raised so the caller can surface the right HTTP status
+    code and a human-readable error message.
+
+    Response shape (tier 1 success)::
 
         {
           "statusCode": 0,
           "userInfo": {
             "user": {
-              "id": "123456789",      ← what we return
+              "id": "123456789",      ← returned
               "uniqueId": "username",
               "secUid": "MS4wLjAB...",
               ...
@@ -168,79 +303,125 @@ async def resolve_author_id(username: str, client: httpx.AsyncClient) -> str:
 
     Raises:
         UserNotFoundError:   User does not exist, is private, or is banned.
-        TikTokBlockedError:  HTTP-level block / rate-limit / server error.
+        TikTokBlockedError:  Both tiers failed due to rate-limiting / blocking.
     """
     url = f"{TIKTOK_BASE}{_USER_DETAIL_PATH}"
     params = {"uniqueId": username, "aid": _AID}
-    headers = {**_BASE_API_HEADERS, "Referer": f"{TIKTOK_BASE}/"}
+
+    # ── Tier 1: JSON API ──────────────────────────────────────────────────────
+    # Use enhanced headers to look like a legitimate XHR from TikTok's SPA:
+    #   • Referer set to the user's own profile page (most natural origin).
+    #   • A plausible msToken cookie value to reduce bot-detection scores.
+    tier1_headers = {
+        **_BASE_API_HEADERS,
+        "Referer": f"{TIKTOK_BASE}/@{username}",
+        "Cookie": _USER_DETAIL_COOKIE,
+    }
 
     logger.info(
-        "resolve_author_id: GET %s?uniqueId=%s", url, username
+        "resolve_author_id [tier-1]: GET %s?uniqueId=%s", url, username
     )
 
+    tier1_failed = False  # set to True if we must fall through to tier 2
+
     try:
-        resp = await client.get(url, params=params, headers=headers)
+        resp = await client.get(url, params=params, headers=tier1_headers)
     except httpx.RequestError as exc:
-        raise TikTokBlockedError(
-            f"resolve_author_id: network error for '@{username}': {exc}"
-        ) from exc
+        logger.warning(
+            "resolve_author_id [tier-1]: network error for '@%s': %s — trying HTML fallback",
+            username, exc,
+        )
+        tier1_failed = True
+        resp = None  # type: ignore[assignment]
 
-    logger.debug(
-        "resolve_author_id: response  status=%d  username=%r",
-        resp.status_code,
-        username,
+    if resp is not None:
+        logger.debug(
+            "resolve_author_id [tier-1]: status=%d  content-type=%r  username=%r",
+            resp.status_code,
+            resp.headers.get("content-type", ""),
+            username,
+        )
+
+        # ── HTTP-level hard errors → do not fall back, raise immediately ──────
+        if resp.status_code == 404:
+            raise UserNotFoundError(
+                f"TikTok returned HTTP 404 for user detail of '@{username}'."
+            )
+
+        # Non-200 OR non-JSON content-type → fall through to HTML fallback.
+        if resp.status_code != 200 or not _is_json_content_type(resp):
+            raw_preview = resp.text[:300].replace("\n", " ")
+            logger.warning(
+                "resolve_author_id [tier-1]: non-JSON or non-200 response for '@%s' "
+                "(status=%d  content-type=%r) — falling back to HTML.  Preview: %r",
+                username,
+                resp.status_code,
+                resp.headers.get("content-type", ""),
+                raw_preview,
+            )
+            tier1_failed = True
+
+        else:
+            # ── Parse JSON safely ─────────────────────────────────────────────
+            try:
+                body: dict = resp.json()
+            except Exception as json_exc:
+                raw_preview = resp.text[:300].replace("\n", " ")
+                logger.warning(
+                    "resolve_author_id [tier-1]: JSON decode failed for '@%s': %s "
+                    "— falling back to HTML.  Preview: %r",
+                    username, json_exc, raw_preview,
+                )
+                tier1_failed = True
+            else:
+                # ── TikTok internal status code ───────────────────────────────
+                try:
+                    _check_tiktok_status(body, f"resolve_author_id('@{username}')")
+                except UserNotFoundError:
+                    raise  # propagate directly — no point in trying HTML
+                except TikTokBlockedError:
+                    logger.warning(
+                        "resolve_author_id [tier-1]: TikTok status error for '@%s' "
+                        "— falling back to HTML.",
+                        username,
+                    )
+                    tier1_failed = True
+
+                if not tier1_failed:
+                    # ── Extract author_id ─────────────────────────────────────
+                    user_info: dict = body.get("userInfo") or {}
+                    user: dict = user_info.get("user") or {}
+                    author_id: str | None = user.get("id")
+
+                    if not author_id:
+                        logger.warning(
+                            "resolve_author_id [tier-1]: 'id' field missing for '@%s' "
+                            "— falling back to HTML.",
+                            username,
+                        )
+                        tier1_failed = True
+                    else:
+                        logger.info(
+                            "resolve_author_id [tier-1]: resolved  username=%r  author_id=%s",
+                            username, author_id,
+                        )
+                        return author_id
+
+    # ── Tier 2: HTML regex fallback ───────────────────────────────────────────
+    if tier1_failed:
+        logger.info(
+            "resolve_author_id: tier-1 failed for '@%s', attempting HTML fallback.",
+            username,
+        )
+        # _resolve_via_html_fallback raises UserNotFoundError or TikTokBlockedError
+        # on failure, which propagate naturally to the caller.
+        return await _resolve_via_html_fallback(username, client)
+
+    # Should be unreachable, but satisfies type-checkers.
+    raise TikTokBlockedError(
+        f"resolve_author_id: failed to resolve '@{username}' via any strategy. "
+        "Account may be private or IP throttled."
     )
-
-    # ── HTTP-level errors ─────────────────────────────────────────────────────
-    if resp.status_code == 404:
-        raise UserNotFoundError(
-            f"TikTok returned HTTP 404 for user detail of '@{username}'."
-        )
-    if resp.status_code in (403, 429):
-        raise TikTokBlockedError(
-            f"TikTok blocked user-detail request for '@{username}' "
-            f"(HTTP {resp.status_code})."
-        )
-    if resp.status_code >= 500:
-        raise TikTokBlockedError(
-            f"TikTok server error on user-detail for '@{username}' "
-            f"(HTTP {resp.status_code})."
-        )
-    if resp.status_code != 200:
-        raise TikTokBlockedError(
-            f"Unexpected HTTP {resp.status_code} from user-detail "
-            f"for '@{username}'."
-        )
-
-    # ── Parse JSON ────────────────────────────────────────────────────────────
-    try:
-        body: dict = resp.json()
-    except Exception as exc:
-        raise TikTokBlockedError(
-            f"resolve_author_id: non-JSON response for '@{username}': {exc}"
-        ) from exc
-
-    # ── TikTok internal status code ───────────────────────────────────────────
-    _check_tiktok_status(body, f"resolve_author_id('@{username}')")
-
-    # ── Extract author_id ─────────────────────────────────────────────────────
-    user_info: dict = body.get("userInfo") or {}
-    user: dict = user_info.get("user") or {}
-    author_id: str | None = user.get("id")
-
-    if not author_id:
-        raise UserNotFoundError(
-            f"resolve_author_id: 'id' field missing in TikTok user-detail "
-            f"response for '@{username}'. "
-            "The account may not exist or may be inaccessible."
-        )
-
-    logger.info(
-        "resolve_author_id: resolved  username=%r  author_id=%s",
-        username,
-        author_id,
-    )
-    return author_id
 
 
 async def fetch_stories_for_user(username: str) -> dict:
