@@ -157,6 +157,14 @@ async def get_stories(
         ),
         examples=["6797910539677074437"],
     ),
+    sec_uid: str | None = Query(
+        default=None,
+        description=(
+            "Optional: TikTok secUid for the user. "
+            "When supplied alongside author_id, it is appended to the story-API "
+            "request so TikTok can resolve the account without extra lookups."
+        ),
+    ),
 ) -> ParsedStoriesResponse:
     """
     Protected endpoint — fetches and parses TikTok stories for *username*.
@@ -164,6 +172,8 @@ async def get_stories(
     If ``author_id`` is provided in the query string, the username-resolution
     step is bypassed completely and stories are fetched directly from the
     story API — this path is immune to profile-page anti-bot challenges.
+    ``sec_uid`` can optionally accompany ``author_id`` to further improve
+    the API success rate.
 
     Error conditions returned as structured JSON:
 
@@ -174,13 +184,17 @@ async def get_stories(
     | 502  | TikTok blocked the request or the browser failed |
     | 500  | Unexpected internal error |
     """
-    # ── Fast path: author_id supplied ─────────────────────────────────────────
+    # ── Fast path: author_id supplied ─────────────────────────────────────
     if author_id:
         logger.info(
-            "get_stories: direct mode  username=%r  author_id=%s", username, author_id
+            "get_stories: direct mode  username=%r  author_id=%s  sec_uid=%s",
+            username, author_id,
+            (sec_uid[:20] + "…") if sec_uid else "",
         )
         try:
-            story_json = await fetch_tiktok_stories_direct(author_id)
+            story_json = await fetch_tiktok_stories_direct(
+                author_id, sec_uid=sec_uid or ""
+            )
         except StoriesNotFoundError as exc:
             logger.info("get_stories: no stories (direct)  author_id=%s", author_id)
             raise HTTPException(
@@ -197,11 +211,8 @@ async def get_stories(
             ) from exc
 
         parsed = parse_story_response(story_json)
-        if not parsed.get("stories"):
-            raise HTTPException(
-                status_code=404,
-                detail={"success": False, "error": "No active stories found for this author."},
-            )
+        # Zero stories from a graceful 400/403 response — return success with
+        # empty list so n8n workflows receive a structured 200 instead of a 404.
         logger.info(
             "get_stories: done (direct)  author_id=%s  story_count=%d",
             author_id, parsed.get("story_count", 0),

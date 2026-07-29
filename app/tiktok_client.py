@@ -32,7 +32,9 @@ Architecture
 from __future__ import annotations
 
 import logging
+import random
 import re
+import string
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -69,6 +71,27 @@ _SPOOF_MS_TOKEN = (
     "msToken=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789AB"
 )
 _SPOOF_COOKIES = f"{_SPOOF_TTWID}; {_SPOOF_MS_TOKEN}"
+
+_MS_TOKEN_ALPHABET = string.ascii_letters + string.digits
+
+
+def _make_story_cookies() -> str:
+    """
+    Build a realistic Cookie header value for each story-API request.
+
+    - ``ttwid``   — fixed plausible format (URL-encoded pipe-separated fields).
+    - ``msToken`` — 107-character random alphanumeric string, freshly generated
+      on every call so repeated requests don't look like a replayed session.
+
+    Neither value is a real session token; they are used solely to satisfy
+    TikTok's surface-level bot-detection checks.
+    """
+    ms_token = "".join(random.choices(_MS_TOKEN_ALPHABET, k=107))
+    return (
+        "ttwid=1%7CfakeBase64EncodedTTWidValue%7C1700000000%7C"
+        "abcdef1234567890abcdef1234567890abcdef12"
+        f"; msToken={ms_token}"
+    )
 
 # Base headers shared by every TikTok internal API call.
 # NOTE: Accept-Encoding is intentionally OMITTED here.
@@ -535,32 +558,55 @@ async def resolve_author_id(username: str, client: httpx.AsyncClient) -> str:
 
 # ── Direct story fetcher (author_id already known) ────────────────────────────
 
-async def fetch_tiktok_stories_direct(author_id: str) -> dict:
+async def fetch_tiktok_stories_direct(
+    author_id: str,
+    sec_uid: str = "",
+) -> dict:
     """
     Paginate ``/api/story/item_list/`` when the caller already has a numeric
-    ``author_id`` and wants to skip the username-resolution step entirely.
+    ``author_id`` (and optionally a ``secUid``) and wants to skip the
+    username-resolution step entirely.
 
     This is the fast path used by the ``/stories`` route when the client
     supplies ``?author_id=<id>`` directly (e.g. from a cached n8n variable).
 
-    Endpoint::
+    Mandatory URL parameters sent on every request::
 
-        GET /api/story/item_list/?author_id={author_id}&count=30
-                                  &cursor={cursor}&aid=1988
+        author_id        — numeric user ID
+        count            — 30
+        cursor           — pagination cursor (starts at 0)
+        aid              — 1988
+        device_platform  — web_pc
+        region           — US
+        priority_region  — US
+        secUid           — included only when sec_uid is non-empty
+
+    HTTP 400 / 403 handling
+    -----------------------
+    Instead of raising and crashing the caller, a 400 or 403 response is
+    treated as "zero stories" — the response body is logged at WARNING level
+    for debugging and the function returns an empty ``itemList`` dict so n8n
+    receives ``{"success": true, "story_count": 0, "stories": []}`` rather
+    than a 5xx error.
 
     Args:
         author_id: Numeric TikTok author_id string (e.g. ``"6797910539677074437"``).
+        sec_uid:   Optional TikTok secUid string. When non-empty it is appended
+                   to the query so TikTok can resolve the account without an
+                   additional profile lookup.
 
     Returns:
-        Same merged dict as ``fetch_stories_for_user`` —
-        ``{"itemList": [...], ...}``.
+        Merged dict ``{"itemList": [...], ...}`` on success, or
+        ``{"itemList": [], "status_code": 0}`` when TikTok returns 400/403.
 
     Raises:
-        StoriesNotFoundError: No active stories for this author_id.
-        TikTokBlockedError:   TikTok rate-limited or blocked the request.
+        TikTokBlockedError: On network errors or unexpected non-400/403 errors.
     """
     story_url     = f"{TIKTOK_BASE}{_STORY_API_PATH}"
-    story_headers = {**_BASE_API_HEADERS, "Referer": TIKTOK_BASE + "/"}
+    story_headers = {
+        **_BASE_API_HEADERS,
+        "Referer": f"{TIKTOK_BASE}/",
+    }
 
     all_items: list[dict] = []
     envelope:  dict | None = None
@@ -570,21 +616,36 @@ async def fetch_tiktok_stories_direct(author_id: str) -> dict:
 
     async with _make_client() as client:
         while has_more:
+            # Build mandatory params — all required by TikTok's story API.
             params: dict[str, str] = {
-                "author_id": author_id,
-                "count":     "30",
-                "cursor":    str(cursor),
-                "aid":       _AID,
+                "author_id":       author_id,
+                "count":           "30",
+                "cursor":          str(cursor),
+                "aid":             _AID,
+                "device_platform": "web_pc",
+                "region":          "US",
+                "priority_region": "US",
+            }
+            # secUid is optional but greatly improves success rate when known.
+            if sec_uid:
+                params["secUid"] = sec_uid
+
+            # Fresh random msToken per request to avoid replay-detection.
+            request_headers = {
+                **story_headers,
+                "Cookie": _make_story_cookies(),
             }
 
             logger.info(
-                "fetch_tiktok_stories_direct: page %d  cursor=%s  author_id=%s",
+                "fetch_tiktok_stories_direct: page %d  cursor=%s  author_id=%s  "
+                "sec_uid=%s",
                 page_num, cursor, author_id,
+                (sec_uid[:20] + "…") if sec_uid else "",
             )
 
             try:
                 resp = await client.get(
-                    story_url, params=params, headers=story_headers
+                    story_url, params=params, headers=request_headers
                 )
             except httpx.RequestError as exc:
                 raise TikTokBlockedError(
@@ -597,10 +658,23 @@ async def fetch_tiktok_stories_direct(author_id: str) -> dict:
                 resp.status_code, page_num,
             )
 
-            if resp.status_code in (403, 429):
+            # ── Graceful handling for 400 / 403 ──────────────────────────────
+            # TikTok returns HTTP 400 when mandatory params are wrong or the
+            # author_id is unknown, and 403 when the bot-detection layer fires.
+            # Both cases are treated as "no stories" so n8n does not crash.
+            if resp.status_code in (400, 403):
+                logger.warning(
+                    "fetch_tiktok_stories_direct: HTTP %d for author_id=%s "
+                    "— treating as zero stories.  Body: %r",
+                    resp.status_code, author_id,
+                    resp.text[:600],
+                )
+                return {"itemList": [], "status_code": 0}
+
+            if resp.status_code == 429:
                 raise TikTokBlockedError(
-                    f"TikTok blocked story API for author_id={author_id!r} "
-                    f"(HTTP {resp.status_code})."
+                    f"TikTok rate-limited story API for author_id={author_id!r} "
+                    f"(HTTP 429)."
                 )
             if resp.status_code >= 500:
                 raise TikTokBlockedError(
