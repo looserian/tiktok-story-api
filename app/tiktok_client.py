@@ -76,23 +76,30 @@ _SPOOF_COOKIES = f"{_SPOOF_TTWID}; {_SPOOF_MS_TOKEN}"
 _MS_TOKEN_ALPHABET = string.ascii_letters + string.digits
 
 
-def _make_story_cookies() -> str:
+def _make_cookies_dict() -> dict[str, str]:
     """
-    Build a realistic Cookie header value for each story-API request.
+    Build a browser-realistic cookies dict for each story-API request.
 
-    - ``ttwid``   — fixed plausible format (URL-encoded pipe-separated fields).
+    - ``ttwid``   — fixed plausible URL-encoded pipe-separated string.
     - ``msToken`` — 107-character random alphanumeric string, freshly generated
-      on every call so repeated requests don't look like a replayed session.
+      per call so repeated requests don't look like a replayed session.
 
-    Neither value is a real session token; they are used solely to satisfy
-    TikTok's surface-level bot-detection checks.
+    Returns a plain dict so callers can pass it directly to
+    ``httpx.AsyncClient(cookies=...)`` or merge into existing cookies.
     """
     ms_token = "".join(random.choices(_MS_TOKEN_ALPHABET, k=107))
-    return (
-        "ttwid=1%7CfakeBase64EncodedTTWidValue%7C1700000000%7C"
-        "abcdef1234567890abcdef1234567890abcdef12"
-        f"; msToken={ms_token}"
-    )
+    return {
+        "ttwid":   "1%7CfakeBase64EncodedTTWidValue%7C1700000000%7Cabcdef1234567890abcdef1234567890abcdef12",
+        "msToken": ms_token,
+    }
+
+
+# Keep the old name as an alias so _layer2_json_api (which still builds its
+# own cookie string) is unaffected.
+def _make_story_cookies() -> str:
+    """Legacy string form — used by old callers.  Prefer _make_cookies_dict()."""
+    d = _make_cookies_dict()
+    return f"ttwid={d['ttwid']}; msToken={d['msToken']}"
 
 # Base headers shared by every TikTok internal API call.
 # NOTE: Accept-Encoding is intentionally OMITTED here.
@@ -564,67 +571,95 @@ async def fetch_tiktok_stories_direct(
     sec_uid: str = "",
 ) -> dict:
     """
-    Fetch all stories for a known ``author_id`` / ``sec_uid`` pair using a
-    two-endpoint strategy:
+    Fetch all stories for a known ``author_id`` / ``sec_uid`` pair.
+
+    Uses a two-endpoint strategy with a mandatory full parameter set.
 
     Primary — ``/api/story/item_list/``
     ------------------------------------
-    Full parameter set sent on every request::
+    All mandatory query params sent on every page request::
 
         author_id        — numeric user ID
-        secUid           — TikTok secUid (always sent; required for most accounts)
+        user_id          — same as author_id (TikTok requires both keys)
+        secUid           — TikTok secUid
         count            — 30
         cursor           — pagination cursor (starts at 0)
+        story_type       — 0
+        mode             — 1
         aid              — 1988
         app_name         — tiktok_web
         device_platform  — web_pc
         client_type      — inbox
+        msToken          — fresh 107-char random alphanumeric per request
+        WebIdLastTime    — current UNIX timestamp
 
-    Item extraction checks all known response key variants in order::
+    Item extraction checks all known response key variants::
 
         items  →  itemList  →  aweme_list
 
+    statusCode 10201 on primary → trigger secondary immediately (not a crash).
+
     Secondary fallback — ``/api/user/story/``
     ------------------------------------------
-    Triggered automatically when the primary endpoint returns 0 items.
-    Uses the same parameter set (minus ``cursor`` / ``count`` / ``client_type``).
+    Triggered when primary returns 0 items OR statusCode 10201.
+    Params: author_id, secUid, aid, app_name, device_platform.
 
     HTTP 400 / 403 handling
     -----------------------
-    Both statuses are treated as "zero stories": the response body is logged
-    at WARNING level and the function returns ``{"itemList": [], "status_code": 0}``
-    so n8n receives a clean 200 instead of a 5xx crash.
+    For the PRIMARY endpoint: log body at WARNING then try secondary.
+    For the SECONDARY endpoint: log body and return zero-stories.
+    All non-200 bodies are logged in full (up to 800 chars).
+
+    Cookies
+    -------
+    Each request gets its own ``httpx.AsyncClient`` instance with fresh
+    ``ttwid`` + ``msToken`` cookies injected via ``httpx`` cookies kwarg
+    (real cookie jar, not a raw header string).
 
     Args:
         author_id: Numeric TikTok author_id string.
-        sec_uid:   TikTok secUid string. Strongly recommended; many accounts
-                   return 0 stories without it.
+        sec_uid:   TikTok secUid.  Strongly recommended; many accounts return
+                   0 stories or statusCode 10201 without it.
 
     Returns:
-        Merged dict with ``"itemList"`` containing all collected stories.
-        Returns ``{"itemList": [], "status_code": 0}`` when both endpoints
-        confirm zero active stories or return 400/403.
+        Merged dict with ``"itemList"`` key containing all collected stories,
+        or ``{"itemList": [], "status_code": 0}`` when both endpoints confirm
+        zero active stories.
 
     Raises:
-        TikTokBlockedError: On network errors or unexpected HTTP codes.
+        StoriesNotFoundError: Both endpoints confirm user has no active stories.
+        TikTokBlockedError:   Network error or unexpected HTTP status code.
     """
 
-    # ── Shared request infrastructure ─────────────────────────────────────────
-    story_headers = {
-        **_BASE_API_HEADERS,
-        "Referer": f"{TIKTOK_BASE}/",
-    }
+    # ── Inner helpers scoped to this call ─────────────────────────────────────
 
-    def _build_primary_params(cursor: int | str) -> dict[str, str]:
-        """Return the full mandatory param dict for /api/story/item_list/."""
+    def _build_primary_params(cursor: int | str, ms_token: str) -> dict[str, str]:
+        """Full mandatory param dict for /api/story/item_list/."""
         p: dict[str, str] = {
             "author_id":       author_id,
+            "user_id":         author_id,   # TikTok requires both keys
             "count":           "30",
             "cursor":          str(cursor),
+            "story_type":      "0",
+            "mode":            "1",
             "aid":             _AID,
             "app_name":        "tiktok_web",
             "device_platform": "web_pc",
             "client_type":     "inbox",
+            "msToken":         ms_token,
+            "WebIdLastTime":   str(int(time.time())),
+        }
+        if sec_uid:
+            p["secUid"] = sec_uid
+        return p
+
+    def _build_secondary_params() -> dict[str, str]:
+        """Param dict for /api/user/story/ fallback."""
+        p: dict[str, str] = {
+            "author_id":       author_id,
+            "aid":             _AID,
+            "app_name":        "tiktok_web",
+            "device_platform": "web_pc",
         }
         if sec_uid:
             p["secUid"] = sec_uid
@@ -639,43 +674,60 @@ async def fetch_tiktok_stories_direct(
             or []
         )
 
-    async def _story_request(
-        client: httpx.AsyncClient,
+    story_base_headers = {
+        **_BASE_API_HEADERS,
+        "Referer": f"{TIKTOK_BASE}/",
+    }
+
+    async def _do_request(
         url: str,
         params: dict[str, str],
         label: str,
+        *,
+        try_secondary_on_400: bool = False,
     ) -> dict | None:
         """
-        Fire one GET request to a TikTok story endpoint.
+        Fire one authenticated GET request.
 
-        Returns the parsed JSON body on HTTP 200, ``None`` on 400/403
-        (treated as zero-stories), raises ``TikTokBlockedError`` on all
-        other non-200 statuses or network errors.
+        - Injects fresh cookies via ``httpx.AsyncClient(cookies=...)``.
+        - Logs the FULL response body (up to 800 chars) on any non-200 status.
+        - Returns parsed JSON dict on HTTP 200.
+        - Returns ``None`` on 400/403 (caller decides whether to try secondary).
+        - Raises ``TikTokBlockedError`` on 429 / 5xx / other non-200.
         """
-        request_headers = {**story_headers, "Cookie": _make_story_cookies()}
-        try:
-            resp = await client.get(url, params=params, headers=request_headers)
-        except httpx.RequestError as exc:
-            raise TikTokBlockedError(
-                f"{label}: network error — {exc}"
-            ) from exc
+        cookies = _make_cookies_dict()
+        async with _make_client() as client:
+            try:
+                resp = await client.get(
+                    url,
+                    params=params,
+                    headers=story_base_headers,
+                    cookies=cookies,
+                )
+            except httpx.RequestError as exc:
+                raise TikTokBlockedError(f"{label}: network error — {exc}") from exc
 
-        logger.debug("%s: status=%d", label, resp.status_code)
+        logger.debug("%s: HTTP %d", label, resp.status_code)
 
         if resp.status_code in (400, 403):
             logger.warning(
-                "%s: HTTP %d — treating as zero stories.  Body: %r",
-                label, resp.status_code, resp.text[:600],
+                "%s: HTTP %d — raw body: %r",
+                label, resp.status_code, resp.text[:800],
             )
-            return None
+            return None   # caller will try secondary or give up
 
         if resp.status_code == 429:
             raise TikTokBlockedError(f"{label}: rate-limited (HTTP 429).")
         if resp.status_code >= 500:
             raise TikTokBlockedError(
-                f"{label}: server error (HTTP {resp.status_code})."
+                f"{label}: server error (HTTP {resp.status_code}).  "
+                f"Body: {resp.text[:400]}"
             )
         if resp.status_code != 200:
+            logger.warning(
+                "%s: unexpected HTTP %d — body: %r",
+                label, resp.status_code, resp.text[:800],
+            )
             raise TikTokBlockedError(
                 f"{label}: unexpected HTTP {resp.status_code}."
             )
@@ -687,117 +739,147 @@ async def fetch_tiktok_stories_direct(
                 f"{label}: non-JSON response — {exc}"
             ) from exc
 
+    # ── Secondary endpoint helper ───────────────────────────────────────────────
+
+    secondary_url = f"{TIKTOK_BASE}{_USER_STORY_PATH}"
+
+    async def _try_secondary(reason: str) -> list[dict]:
+        """
+        Hit /api/user/story/ and return its item list (may be empty).
+        Swallows errors from the secondary gracefully — they are logged
+        but never propagated so the caller can still return zero-stories.
+        """
+        logger.info(
+            "fetch_tiktok_stories_direct: %s — trying secondary /api/user/story/",
+            reason,
+        )
+        try:
+            body2 = await _do_request(
+                secondary_url,
+                _build_secondary_params(),
+                label="fetch_tiktok_stories_direct/secondary",
+            )
+        except TikTokBlockedError as exc:
+            logger.warning(
+                "fetch_tiktok_stories_direct [secondary]: error — %s", exc
+            )
+            return []
+
+        if body2 is None:
+            logger.info(
+                "fetch_tiktok_stories_direct [secondary]: 400/403 — giving up."
+            )
+            return []
+
+        # Check internal status code; 10201 on secondary means genuinely no stories.
+        sc = body2.get("statusCode") or body2.get("status_code") or 0
+        if sc not in (0, None):
+            logger.warning(
+                "fetch_tiktok_stories_direct [secondary]: statusCode=%s — body: %r",
+                sc, str(body2)[:400],
+            )
+            return []
+
+        items = _extract_items(body2)
+        logger.info(
+            "fetch_tiktok_stories_direct [secondary]: found %d items", len(items)
+        )
+        return items
+
     # ── Primary endpoint: /api/story/item_list/ ────────────────────────────────
     primary_url = f"{TIKTOK_BASE}{_STORY_API_PATH}"
 
-    all_items: list[dict] = []
-    envelope:  dict | None = None
-    cursor:    int | str = 0
-    has_more:  bool = True
-    page_num:  int  = 1
+    all_items:  list[dict] = []
+    envelope:   dict | None = None
+    cursor:     int | str = 0
+    has_more:   bool = True
+    page_num:   int  = 1
+    use_secondary = False   # set to True when primary signals we should fall back
 
-    async with _make_client() as client:
-        while has_more:
-            params = _build_primary_params(cursor)
+    while has_more and not use_secondary:
+        ms_token = "".join(random.choices(_MS_TOKEN_ALPHABET, k=107))
+        params   = _build_primary_params(cursor, ms_token)
 
+        logger.info(
+            "fetch_tiktok_stories_direct [primary]: page %d  cursor=%s  "
+            "author_id=%s  sec_uid=%s",
+            page_num, cursor, author_id,
+            (sec_uid[:20] + "…") if sec_uid else "(none)",
+        )
+
+        body = await _do_request(
+            primary_url, params,
+            label=f"fetch_tiktok_stories_direct/primary page {page_num}",
+        )
+
+        if body is None:
+            # 400 / 403 from primary — log already done; try secondary.
             logger.info(
-                "fetch_tiktok_stories_direct [primary]: page %d  cursor=%s  "
-                "author_id=%s  sec_uid=%s",
-                page_num, cursor, author_id,
-                (sec_uid[:20] + "…") if sec_uid else "(none)",
+                "fetch_tiktok_stories_direct [primary]: 400/403 on page %d — "
+                "falling back to secondary.",
+                page_num,
             )
+            use_secondary = True
+            break
 
-            body = await _story_request(
-                client, primary_url, params,
-                label=f"fetch_tiktok_stories_direct/primary page {page_num}",
+        # Check TikTok's internal status code.
+        sc = body.get("statusCode") or body.get("status_code") or 0
+        if sc == 10201:
+            # "Missing required fields" or "user not found" — try secondary.
+            logger.warning(
+                "fetch_tiktok_stories_direct [primary]: statusCode=10201 on "
+                "page %d (author_id=%s) — falling back to secondary.",
+                page_num, author_id,
             )
-
-            if body is None:
-                # 400/403 — stop immediately, skip secondary, return empty.
-                return {"itemList": [], "status_code": 0}
-
-            _check_tiktok_status(
-                body,
-                f"fetch_tiktok_stories_direct/primary page {page_num}",
+            use_secondary = True
+            break
+        elif sc != 0:
+            # Any other non-zero internal code — log it, then also try secondary.
+            logger.warning(
+                "fetch_tiktok_stories_direct [primary]: non-zero statusCode=%s "
+                "on page %d — body: %r",
+                sc, page_num, str(body)[:400],
             )
+            use_secondary = True
+            break
 
-            page_items = _extract_items(body)
-            all_items.extend(page_items)
+        page_items = _extract_items(body)
+        all_items.extend(page_items)
 
-            cursor   = body.get("cursor") or body.get("minCursor") or 0
-            has_more = bool(body.get("has_more") or body.get("hasMore"))
-            envelope = {k: v for k, v in body.items()
-                        if k not in ("items", "itemList", "aweme_list")}
+        cursor   = body.get("cursor") or body.get("minCursor") or 0
+        has_more = bool(body.get("has_more") or body.get("hasMore"))
+        envelope = {k: v for k, v in body.items()
+                    if k not in ("items", "itemList", "aweme_list")}
 
+        logger.info(
+            "fetch_tiktok_stories_direct [primary]: page %d done  "
+            "page_items=%d  has_more=%s  total=%d",
+            page_num, len(page_items), has_more, len(all_items),
+        )
+
+        page_num += 1
+
+        if not page_items:
             logger.info(
-                "fetch_tiktok_stories_direct [primary]: page %d done  "
-                "page_items=%d  has_more=%s  total=%d",
-                page_num, len(page_items), has_more, len(all_items),
+                "fetch_tiktok_stories_direct [primary]: empty page — stopping"
             )
+            break
 
-            page_num += 1
-
-            if not page_items:
-                logger.info(
-                    "fetch_tiktok_stories_direct [primary]: empty page — stopping"
-                )
-                break
-
-        # ── Secondary fallback: /api/user/story/ ──────────────────────────────
-        # Triggered only when the primary returned 0 items across all pages.
-        if not all_items:
-            logger.info(
-                "fetch_tiktok_stories_direct: primary returned 0 items for "
-                "author_id=%s — trying secondary endpoint /api/user/story/.",
-                author_id,
-            )
-
-            secondary_url = f"{TIKTOK_BASE}{_USER_STORY_PATH}"
-            secondary_params: dict[str, str] = {
-                "author_id":       author_id,
-                "aid":             _AID,
-                "app_name":        "tiktok_web",
-                "device_platform": "web_pc",
-            }
-            if sec_uid:
-                secondary_params["secUid"] = sec_uid
-
-            body2 = await _story_request(
-                client, secondary_url, secondary_params,
-                label="fetch_tiktok_stories_direct/secondary",
-            )
-
-            if body2 is not None:
-                try:
-                    _check_tiktok_status(
-                        body2, "fetch_tiktok_stories_direct/secondary"
-                    )
-                except (UserNotFoundError, TikTokBlockedError) as exc:
-                    logger.warning(
-                        "fetch_tiktok_stories_direct [secondary]: status error — %s",
-                        exc,
-                    )
-                else:
-                    secondary_items = _extract_items(body2)
-                    if secondary_items:
-                        logger.info(
-                            "fetch_tiktok_stories_direct [secondary]: found %d items",
-                            len(secondary_items),
-                        )
-                        all_items = secondary_items
-                        envelope  = {k: v for k, v in body2.items()
-                                     if k not in ("items", "itemList", "aweme_list")}
-                    else:
-                        logger.info(
-                            "fetch_tiktok_stories_direct [secondary]: also 0 items."
-                        )
+    # ── Secondary fallback ────────────────────────────────────────────────────────
+    if not all_items:   # covers both use_secondary=True and genuine 0 pages
+        secondary_items = await _try_secondary(
+            reason=("primary HTTP 400/403 or statusCode error"
+                    if use_secondary else "primary returned 0 items")
+        )
+        if secondary_items:
+            all_items = secondary_items
+            # envelope stays None; the merged dict will only have itemList
 
     logger.info(
         "fetch_tiktok_stories_direct: complete  author_id=%s  total_items=%d",
         author_id, len(all_items),
     )
 
-    # Both endpoints returned nothing — surface as zero-stories (not an error).
     if not all_items:
         raise StoriesNotFoundError(
             f"No active stories found for author_id={author_id!r}."
