@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 TIKTOK_BASE      = "https://www.tiktok.com"
 _USER_DETAIL_PATH = "/api/user/detail/"
 _STORY_API_PATH   = "/api/story/item_list/"
+_USER_STORY_PATH  = "/api/user/story/"         # secondary fallback endpoint
 
 # TikTok Web app-ID — required parameter on all internal API calls.
 _AID = "1988"
@@ -563,50 +564,131 @@ async def fetch_tiktok_stories_direct(
     sec_uid: str = "",
 ) -> dict:
     """
-    Paginate ``/api/story/item_list/`` when the caller already has a numeric
-    ``author_id`` (and optionally a ``secUid``) and wants to skip the
-    username-resolution step entirely.
+    Fetch all stories for a known ``author_id`` / ``sec_uid`` pair using a
+    two-endpoint strategy:
 
-    This is the fast path used by the ``/stories`` route when the client
-    supplies ``?author_id=<id>`` directly (e.g. from a cached n8n variable).
-
-    Mandatory URL parameters sent on every request::
+    Primary — ``/api/story/item_list/``
+    ------------------------------------
+    Full parameter set sent on every request::
 
         author_id        — numeric user ID
+        secUid           — TikTok secUid (always sent; required for most accounts)
         count            — 30
         cursor           — pagination cursor (starts at 0)
         aid              — 1988
+        app_name         — tiktok_web
         device_platform  — web_pc
-        region           — US
-        priority_region  — US
-        secUid           — included only when sec_uid is non-empty
+        client_type      — inbox
+
+    Item extraction checks all known response key variants in order::
+
+        items  →  itemList  →  aweme_list
+
+    Secondary fallback — ``/api/user/story/``
+    ------------------------------------------
+    Triggered automatically when the primary endpoint returns 0 items.
+    Uses the same parameter set (minus ``cursor`` / ``count`` / ``client_type``).
 
     HTTP 400 / 403 handling
     -----------------------
-    Instead of raising and crashing the caller, a 400 or 403 response is
-    treated as "zero stories" — the response body is logged at WARNING level
-    for debugging and the function returns an empty ``itemList`` dict so n8n
-    receives ``{"success": true, "story_count": 0, "stories": []}`` rather
-    than a 5xx error.
+    Both statuses are treated as "zero stories": the response body is logged
+    at WARNING level and the function returns ``{"itemList": [], "status_code": 0}``
+    so n8n receives a clean 200 instead of a 5xx crash.
 
     Args:
-        author_id: Numeric TikTok author_id string (e.g. ``"6797910539677074437"``).
-        sec_uid:   Optional TikTok secUid string. When non-empty it is appended
-                   to the query so TikTok can resolve the account without an
-                   additional profile lookup.
+        author_id: Numeric TikTok author_id string.
+        sec_uid:   TikTok secUid string. Strongly recommended; many accounts
+                   return 0 stories without it.
 
     Returns:
-        Merged dict ``{"itemList": [...], ...}`` on success, or
-        ``{"itemList": [], "status_code": 0}`` when TikTok returns 400/403.
+        Merged dict with ``"itemList"`` containing all collected stories.
+        Returns ``{"itemList": [], "status_code": 0}`` when both endpoints
+        confirm zero active stories or return 400/403.
 
     Raises:
-        TikTokBlockedError: On network errors or unexpected non-400/403 errors.
+        TikTokBlockedError: On network errors or unexpected HTTP codes.
     """
-    story_url     = f"{TIKTOK_BASE}{_STORY_API_PATH}"
+
+    # ── Shared request infrastructure ─────────────────────────────────────────
     story_headers = {
         **_BASE_API_HEADERS,
         "Referer": f"{TIKTOK_BASE}/",
     }
+
+    def _build_primary_params(cursor: int | str) -> dict[str, str]:
+        """Return the full mandatory param dict for /api/story/item_list/."""
+        p: dict[str, str] = {
+            "author_id":       author_id,
+            "count":           "30",
+            "cursor":          str(cursor),
+            "aid":             _AID,
+            "app_name":        "tiktok_web",
+            "device_platform": "web_pc",
+            "client_type":     "inbox",
+        }
+        if sec_uid:
+            p["secUid"] = sec_uid
+        return p
+
+    def _extract_items(body: dict) -> list[dict]:
+        """Extract story items regardless of which key TikTok used."""
+        return (
+            body.get("items")
+            or body.get("itemList")
+            or body.get("aweme_list")
+            or []
+        )
+
+    async def _story_request(
+        client: httpx.AsyncClient,
+        url: str,
+        params: dict[str, str],
+        label: str,
+    ) -> dict | None:
+        """
+        Fire one GET request to a TikTok story endpoint.
+
+        Returns the parsed JSON body on HTTP 200, ``None`` on 400/403
+        (treated as zero-stories), raises ``TikTokBlockedError`` on all
+        other non-200 statuses or network errors.
+        """
+        request_headers = {**story_headers, "Cookie": _make_story_cookies()}
+        try:
+            resp = await client.get(url, params=params, headers=request_headers)
+        except httpx.RequestError as exc:
+            raise TikTokBlockedError(
+                f"{label}: network error — {exc}"
+            ) from exc
+
+        logger.debug("%s: status=%d", label, resp.status_code)
+
+        if resp.status_code in (400, 403):
+            logger.warning(
+                "%s: HTTP %d — treating as zero stories.  Body: %r",
+                label, resp.status_code, resp.text[:600],
+            )
+            return None
+
+        if resp.status_code == 429:
+            raise TikTokBlockedError(f"{label}: rate-limited (HTTP 429).")
+        if resp.status_code >= 500:
+            raise TikTokBlockedError(
+                f"{label}: server error (HTTP {resp.status_code})."
+            )
+        if resp.status_code != 200:
+            raise TikTokBlockedError(
+                f"{label}: unexpected HTTP {resp.status_code}."
+            )
+
+        try:
+            return resp.json()
+        except Exception as exc:
+            raise TikTokBlockedError(
+                f"{label}: non-JSON response — {exc}"
+            ) from exc
+
+    # ── Primary endpoint: /api/story/item_list/ ────────────────────────────────
+    primary_url = f"{TIKTOK_BASE}{_STORY_API_PATH}"
 
     all_items: list[dict] = []
     envelope:  dict | None = None
@@ -616,115 +698,106 @@ async def fetch_tiktok_stories_direct(
 
     async with _make_client() as client:
         while has_more:
-            # Build mandatory params — all required by TikTok's story API.
-            params: dict[str, str] = {
-                "author_id":       author_id,
-                "count":           "30",
-                "cursor":          str(cursor),
-                "aid":             _AID,
-                "device_platform": "web_pc",
-                "region":          "US",
-                "priority_region": "US",
-            }
-            # secUid is optional but greatly improves success rate when known.
-            if sec_uid:
-                params["secUid"] = sec_uid
-
-            # Fresh random msToken per request to avoid replay-detection.
-            request_headers = {
-                **story_headers,
-                "Cookie": _make_story_cookies(),
-            }
+            params = _build_primary_params(cursor)
 
             logger.info(
-                "fetch_tiktok_stories_direct: page %d  cursor=%s  author_id=%s  "
-                "sec_uid=%s",
+                "fetch_tiktok_stories_direct [primary]: page %d  cursor=%s  "
+                "author_id=%s  sec_uid=%s",
                 page_num, cursor, author_id,
-                (sec_uid[:20] + "…") if sec_uid else "",
+                (sec_uid[:20] + "…") if sec_uid else "(none)",
             )
 
-            try:
-                resp = await client.get(
-                    story_url, params=params, headers=request_headers
-                )
-            except httpx.RequestError as exc:
-                raise TikTokBlockedError(
-                    f"fetch_tiktok_stories_direct: network error on page {page_num} "
-                    f"for author_id={author_id!r}: {exc}"
-                ) from exc
-
-            logger.debug(
-                "fetch_tiktok_stories_direct: response  status=%d  page=%d",
-                resp.status_code, page_num,
+            body = await _story_request(
+                client, primary_url, params,
+                label=f"fetch_tiktok_stories_direct/primary page {page_num}",
             )
 
-            # ── Graceful handling for 400 / 403 ──────────────────────────────
-            # TikTok returns HTTP 400 when mandatory params are wrong or the
-            # author_id is unknown, and 403 when the bot-detection layer fires.
-            # Both cases are treated as "no stories" so n8n does not crash.
-            if resp.status_code in (400, 403):
-                logger.warning(
-                    "fetch_tiktok_stories_direct: HTTP %d for author_id=%s "
-                    "— treating as zero stories.  Body: %r",
-                    resp.status_code, author_id,
-                    resp.text[:600],
-                )
+            if body is None:
+                # 400/403 — stop immediately, skip secondary, return empty.
                 return {"itemList": [], "status_code": 0}
 
-            if resp.status_code == 429:
-                raise TikTokBlockedError(
-                    f"TikTok rate-limited story API for author_id={author_id!r} "
-                    f"(HTTP 429)."
-                )
-            if resp.status_code >= 500:
-                raise TikTokBlockedError(
-                    f"TikTok story API server error for author_id={author_id!r} "
-                    f"(HTTP {resp.status_code})."
-                )
-            if resp.status_code != 200:
-                raise TikTokBlockedError(
-                    f"Unexpected HTTP {resp.status_code} from story API "
-                    f"for author_id={author_id!r}."
-                )
-
-            try:
-                body: dict = resp.json()
-            except Exception as exc:
-                raise TikTokBlockedError(
-                    f"fetch_tiktok_stories_direct: non-JSON response on page "
-                    f"{page_num} for author_id={author_id!r}: {exc}"
-                ) from exc
-
             _check_tiktok_status(
-                body, f"fetch_tiktok_stories_direct(author_id={author_id!r}) page {page_num}"
+                body,
+                f"fetch_tiktok_stories_direct/primary page {page_num}",
             )
 
-            page_items: list[dict] = body.get("itemList") or []
+            page_items = _extract_items(body)
             all_items.extend(page_items)
 
             cursor   = body.get("cursor") or body.get("minCursor") or 0
             has_more = bool(body.get("has_more") or body.get("hasMore"))
-            envelope = {k: v for k, v in body.items() if k != "itemList"}
+            envelope = {k: v for k, v in body.items()
+                        if k not in ("items", "itemList", "aweme_list")}
 
             logger.info(
-                "fetch_tiktok_stories_direct: page %d done  "
-                "page_items=%d  cursor=%s  has_more=%s  total=%d",
-                page_num, len(page_items), cursor, has_more, len(all_items),
+                "fetch_tiktok_stories_direct [primary]: page %d done  "
+                "page_items=%d  has_more=%s  total=%d",
+                page_num, len(page_items), has_more, len(all_items),
             )
 
             page_num += 1
 
             if not page_items:
                 logger.info(
-                    "fetch_tiktok_stories_direct: empty page — stopping pagination"
+                    "fetch_tiktok_stories_direct [primary]: empty page — stopping"
                 )
                 break
 
+        # ── Secondary fallback: /api/user/story/ ──────────────────────────────
+        # Triggered only when the primary returned 0 items across all pages.
+        if not all_items:
+            logger.info(
+                "fetch_tiktok_stories_direct: primary returned 0 items for "
+                "author_id=%s — trying secondary endpoint /api/user/story/.",
+                author_id,
+            )
+
+            secondary_url = f"{TIKTOK_BASE}{_USER_STORY_PATH}"
+            secondary_params: dict[str, str] = {
+                "author_id":       author_id,
+                "aid":             _AID,
+                "app_name":        "tiktok_web",
+                "device_platform": "web_pc",
+            }
+            if sec_uid:
+                secondary_params["secUid"] = sec_uid
+
+            body2 = await _story_request(
+                client, secondary_url, secondary_params,
+                label="fetch_tiktok_stories_direct/secondary",
+            )
+
+            if body2 is not None:
+                try:
+                    _check_tiktok_status(
+                        body2, "fetch_tiktok_stories_direct/secondary"
+                    )
+                except (UserNotFoundError, TikTokBlockedError) as exc:
+                    logger.warning(
+                        "fetch_tiktok_stories_direct [secondary]: status error — %s",
+                        exc,
+                    )
+                else:
+                    secondary_items = _extract_items(body2)
+                    if secondary_items:
+                        logger.info(
+                            "fetch_tiktok_stories_direct [secondary]: found %d items",
+                            len(secondary_items),
+                        )
+                        all_items = secondary_items
+                        envelope  = {k: v for k, v in body2.items()
+                                     if k not in ("items", "itemList", "aweme_list")}
+                    else:
+                        logger.info(
+                            "fetch_tiktok_stories_direct [secondary]: also 0 items."
+                        )
+
     logger.info(
-        "fetch_tiktok_stories_direct: done  author_id=%s  total_items=%d",
+        "fetch_tiktok_stories_direct: complete  author_id=%s  total_items=%d",
         author_id, len(all_items),
     )
 
+    # Both endpoints returned nothing — surface as zero-stories (not an error).
     if not all_items:
         raise StoriesNotFoundError(
             f"No active stories found for author_id={author_id!r}."
