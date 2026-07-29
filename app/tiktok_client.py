@@ -885,17 +885,19 @@ async def fetch_tiktok_stories_direct(
     if not all_items:
         if username:
             logger.info(
-                "fetch_tiktok_stories_direct: Level 1 httpx returned 0 items for author_id=%s. "
-                "Triggering Level 2 Playwright interceptor fallback for username=%r",
-                author_id, username,
+                "Direct HTTP failed or returned 0 items. Triggering Playwright XHR Interceptor fallback."
             )
             try:
-                return await fetch_stories_via_playwright_interceptor(username)
-            except StoriesNotFoundError:
-                raise
+                items = await fetch_stories_via_playwright(username)
+                if items:
+                    logger.info(
+                        "fetch_tiktok_stories_direct: Playwright interceptor captured %d items for '@%s'",
+                        len(items), username,
+                    )
+                    return {"itemList": items, "status_code": 0}
             except Exception as exc:
                 logger.warning(
-                    "fetch_tiktok_stories_direct: Level 2 Playwright interceptor failed for username=%r: %s",
+                    "fetch_tiktok_stories_direct: Playwright fallback failed for username=%r: %s",
                     username, exc,
                 )
         raise StoriesNotFoundError(
@@ -909,166 +911,130 @@ async def fetch_tiktok_stories_direct(
     return merged
 
 
-# ── Playwright Interceptor Fallback (Level 2) ─────────────────────────────────
+# ── Playwright Network Interceptor Fallback ────────────────────────────────────
+
+async def fetch_stories_via_playwright(username: str) -> list[dict]:
+    """
+    Launch Playwright Chromium in headless mode with stealth parameters
+    (--disable-blink-features=AutomationControlled), register a network response
+    listener filtering for URLs matching /api/story/item_list/ or /api/user/story/,
+    navigate to https://www.tiktok.com/@{username}, wait up to 10 seconds for
+    the intercepted response, read response.json(), and return the items array.
+
+    Ensures the browser instance and context are cleanly closed in a finally block.
+    """
+    profile_url = f"{TIKTOK_BASE}/@{username}"
+    logger.info("fetch_stories_via_playwright: starting for username=%r", username)
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        logger.error("Playwright package not installed: %s", exc)
+        return []
+
+    browser = None
+    context = None
+    page = None
+    captured_items: list[dict] = []
+    response_event = asyncio.Event()
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-infobars",
+                    "--window-position=0,0",
+                    "--ignore-certificate-errors",
+                    "--ignore-certificate-errors-spki-list",
+                    f"--user-agent={_UA}",
+                ],
+            )
+            context = await browser.new_context(
+                user_agent=_UA,
+                viewport={"width": 1280, "height": 720},
+                device_scale_factor=1,
+                locale="en-US",
+            )
+            await context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+
+            page = await context.new_page()
+
+            async def handle_response(response):
+                url = response.url
+                if "/api/story/item_list" in url or "/api/user/story" in url:
+                    logger.info(
+                        "Playwright interceptor: intercepted url=%s status=%d",
+                        url, response.status,
+                    )
+                    if response.status == 200:
+                        try:
+                            json_data = await response.json()
+                            raw_items = (
+                                json_data.get("items")
+                                or json_data.get("itemList")
+                                or json_data.get("aweme_list")
+                                or []
+                            )
+                            if raw_items:
+                                nonlocal captured_items
+                                captured_items = raw_items
+                                response_event.set()
+                        except Exception as exc:
+                            logger.warning("Playwright response.json() error for %s: %s", url, exc)
+
+            page.on("response", handle_response)
+
+            logger.info("fetch_stories_via_playwright: navigating to %s", profile_url)
+            try:
+                await page.goto(profile_url, wait_until="domcontentloaded", timeout=10000)
+            except Exception as goto_exc:
+                logger.warning("Playwright page.goto warning for '@%s': %s", username, goto_exc)
+
+            if not captured_items:
+                try:
+                    await asyncio.wait_for(response_event.wait(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.info("Playwright timeout (10s limit) waiting for response event")
+
+    except Exception as exc:
+        logger.warning("fetch_stories_via_playwright error for username=%r: %s", username, exc)
+    finally:
+        if page:
+            try:
+                await page.close()
+            except Exception:
+                pass
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    return captured_items
+
 
 async def fetch_stories_via_playwright_interceptor(username: str) -> dict:
     """
-    Fallback Layer (Level 2): Launch headless Chromium with stealth flags,
-    navigate to TikTok profile page, intercept story XHR responses
-    (matching /api/story/item_list/ or /api/user/story/), and capture raw items.
-
-    Enforces a strict 15-second execution timeout to prevent hangs.
+    Alias wrapper around fetch_stories_via_playwright for backwards compatibility.
+    Returns payload matching n8n schema {"itemList": items, "status_code": 0}.
     """
-    profile_url = f"{TIKTOK_BASE}/@{username}"
-    logger.info(
-        "fetch_stories_via_playwright_interceptor: starting for username=%r", username
+    items = await fetch_stories_via_playwright(username)
+    if items:
+        return {"itemList": items, "status_code": 0}
+    raise StoriesNotFoundError(
+        f"Playwright interceptor: No active stories found for '@{username}'."
     )
-
-    async def _interceptor_task() -> dict:
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError as exc:
-            logger.error("Playwright package not installed: %s", exc)
-            raise TikTokBlockedError(
-                "Playwright interceptor unavailable: playwright is not installed."
-            ) from exc
-
-        async with async_playwright() as p:
-            browser = None
-            context = None
-            page = None
-            captured_payload: dict = {}
-            captured_items: list[dict] = []
-            response_event = asyncio.Event()
-
-            try:
-                # Stealth chromium launch args
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                        "--disable-setuid-sandbox",
-                        "--disable-infobars",
-                        "--window-position=0,0",
-                        "--ignore-certificate-errors",
-                        "--ignore-certificate-errors-spki-list",
-                        f"--user-agent={_UA}",
-                    ],
-                )
-                context = await browser.new_context(
-                    user_agent=_UA,
-                    viewport={"width": 1280, "height": 720},
-                    device_scale_factor=1,
-                    locale="en-US",
-                )
-
-                # Stealth init script to mask navigator.webdriver
-                await context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                )
-
-                page = await context.new_page()
-
-                # Network response listener
-                async def handle_response(response):
-                    url = response.url
-                    if "/api/story/item_list" in url or "/api/user/story" in url:
-                        logger.info(
-                            "Playwright interceptor: intercepted response url=%s status=%d",
-                            url, response.status,
-                        )
-                        if response.status == 200:
-                            try:
-                                json_data = await response.json()
-                                items = (
-                                    json_data.get("items")
-                                    or json_data.get("itemList")
-                                    or json_data.get("aweme_list")
-                                    or []
-                                )
-                                logger.info(
-                                    "Playwright interceptor: extracted %d items from response",
-                                    len(items),
-                                )
-                                if items:
-                                    nonlocal captured_payload, captured_items
-                                    captured_payload = json_data
-                                    captured_items = items
-                                    response_event.set()
-                            except Exception as exc:
-                                logger.warning(
-                                    "Playwright interceptor: JSON parse error for %s: %s",
-                                    url, exc,
-                                )
-
-                page.on("response", handle_response)
-
-                logger.info("Playwright interceptor: navigating to %s", profile_url)
-                try:
-                    await page.goto(profile_url, wait_until="domcontentloaded", timeout=12000)
-                except Exception as goto_exc:
-                    logger.warning("Playwright interceptor: page.goto warning for '@%s': %s", username, goto_exc)
-
-                if not captured_items:
-                    try:
-                        await asyncio.wait_for(response_event.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        logger.info("Playwright interceptor: timeout waiting for response event")
-
-            finally:
-                if page:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                if context:
-                    try:
-                        await context.close()
-                    except Exception:
-                        pass
-                if browser:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
-
-            if captured_items:
-                merged: dict = {}
-                if captured_payload:
-                    envelope = {
-                        k: v for k, v in captured_payload.items()
-                        if k not in ("items", "itemList", "aweme_list")
-                    }
-                    merged.update(envelope)
-                merged["itemList"] = captured_items
-                merged["status_code"] = 0
-                return merged
-
-            raise StoriesNotFoundError(
-                f"Playwright interceptor: No active stories found for '@{username}'."
-            )
-
-    try:
-        # Enforce 15-second execution timeout
-        return await asyncio.wait_for(_interceptor_task(), timeout=15.0)
-    except asyncio.TimeoutError:
-        logger.error(
-            "fetch_stories_via_playwright_interceptor: timed out (15s limit) for username=%r",
-            username,
-        )
-        raise TikTokBlockedError(
-            f"Playwright interceptor timed out after 15 seconds for user '@{username}'."
-        )
-    except (StoriesNotFoundError, TikTokBlockedError):
-        raise
-    except Exception as exc:
-        logger.exception(
-            "fetch_stories_via_playwright_interceptor failed for username=%r", username
-        )
-        raise TikTokBlockedError(
-            f"Playwright interceptor failed for user '@{username}': {exc}"
-        ) from exc
 
 
 # ── Story fetcher ─────────────────────────────────────────────────────────────
@@ -1110,7 +1076,9 @@ async def fetch_stories_for_user(username: str) -> dict:
 
     # ── Level 2: Stealth Playwright Interceptor ─────────────────────────────
     logger.info(
-        "fetch_stories_for_user: Triggering Level 2 Stealth Playwright Interceptor for '@%s'",
-        username,
+        "Direct HTTP failed or returned 0 items. Triggering Playwright XHR Interceptor fallback."
     )
-    return await fetch_stories_via_playwright_interceptor(username)
+    items = await fetch_stories_via_playwright(username)
+    if items:
+        return {"itemList": items, "status_code": 0}
+    raise StoriesNotFoundError(f"No active stories found for user '@{username}'.")
