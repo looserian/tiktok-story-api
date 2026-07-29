@@ -31,6 +31,7 @@ Architecture
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 import re
@@ -569,6 +570,7 @@ async def resolve_author_id(username: str, client: httpx.AsyncClient) -> str:
 async def fetch_tiktok_stories_direct(
     author_id: str,
     sec_uid: str = "",
+    username: str = "",
 ) -> dict:
     """
     Fetch all stories for a known ``author_id`` / ``sec_uid`` pair.
@@ -881,6 +883,21 @@ async def fetch_tiktok_stories_direct(
     )
 
     if not all_items:
+        if username:
+            logger.info(
+                "fetch_tiktok_stories_direct: Level 1 httpx returned 0 items for author_id=%s. "
+                "Triggering Level 2 Playwright interceptor fallback for username=%r",
+                author_id, username,
+            )
+            try:
+                return await fetch_stories_via_playwright_interceptor(username)
+            except StoriesNotFoundError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "fetch_tiktok_stories_direct: Level 2 Playwright interceptor failed for username=%r: %s",
+                    username, exc,
+                )
         raise StoriesNotFoundError(
             f"No active stories found for author_id={author_id!r}."
         )
@@ -892,154 +909,208 @@ async def fetch_tiktok_stories_direct(
     return merged
 
 
+# ── Playwright Interceptor Fallback (Level 2) ─────────────────────────────────
+
+async def fetch_stories_via_playwright_interceptor(username: str) -> dict:
+    """
+    Fallback Layer (Level 2): Launch headless Chromium with stealth flags,
+    navigate to TikTok profile page, intercept story XHR responses
+    (matching /api/story/item_list/ or /api/user/story/), and capture raw items.
+
+    Enforces a strict 15-second execution timeout to prevent hangs.
+    """
+    profile_url = f"{TIKTOK_BASE}/@{username}"
+    logger.info(
+        "fetch_stories_via_playwright_interceptor: starting for username=%r", username
+    )
+
+    async def _interceptor_task() -> dict:
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError as exc:
+            logger.error("Playwright package not installed: %s", exc)
+            raise TikTokBlockedError(
+                "Playwright interceptor unavailable: playwright is not installed."
+            ) from exc
+
+        async with async_playwright() as p:
+            browser = None
+            context = None
+            page = None
+            captured_payload: dict = {}
+            captured_items: list[dict] = []
+            response_event = asyncio.Event()
+
+            try:
+                # Stealth chromium launch args
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-infobars",
+                        "--window-position=0,0",
+                        "--ignore-certificate-errors",
+                        "--ignore-certificate-errors-spki-list",
+                        f"--user-agent={_UA}",
+                    ],
+                )
+                context = await browser.new_context(
+                    user_agent=_UA,
+                    viewport={"width": 1280, "height": 720},
+                    device_scale_factor=1,
+                    locale="en-US",
+                )
+
+                # Stealth init script to mask navigator.webdriver
+                await context.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                )
+
+                page = await context.new_page()
+
+                # Network response listener
+                async def handle_response(response):
+                    url = response.url
+                    if "/api/story/item_list" in url or "/api/user/story" in url:
+                        logger.info(
+                            "Playwright interceptor: intercepted response url=%s status=%d",
+                            url, response.status,
+                        )
+                        if response.status == 200:
+                            try:
+                                json_data = await response.json()
+                                items = (
+                                    json_data.get("items")
+                                    or json_data.get("itemList")
+                                    or json_data.get("aweme_list")
+                                    or []
+                                )
+                                logger.info(
+                                    "Playwright interceptor: extracted %d items from response",
+                                    len(items),
+                                )
+                                if items:
+                                    nonlocal captured_payload, captured_items
+                                    captured_payload = json_data
+                                    captured_items = items
+                                    response_event.set()
+                            except Exception as exc:
+                                logger.warning(
+                                    "Playwright interceptor: JSON parse error for %s: %s",
+                                    url, exc,
+                                )
+
+                page.on("response", handle_response)
+
+                logger.info("Playwright interceptor: navigating to %s", profile_url)
+                try:
+                    await page.goto(profile_url, wait_until="domcontentloaded", timeout=12000)
+                except Exception as goto_exc:
+                    logger.warning("Playwright interceptor: page.goto warning for '@%s': %s", username, goto_exc)
+
+                if not captured_items:
+                    try:
+                        await asyncio.wait_for(response_event.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        logger.info("Playwright interceptor: timeout waiting for response event")
+
+            finally:
+                if page:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                if context:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                if browser:
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+
+            if captured_items:
+                merged: dict = {}
+                if captured_payload:
+                    envelope = {
+                        k: v for k, v in captured_payload.items()
+                        if k not in ("items", "itemList", "aweme_list")
+                    }
+                    merged.update(envelope)
+                merged["itemList"] = captured_items
+                merged["status_code"] = 0
+                return merged
+
+            raise StoriesNotFoundError(
+                f"Playwright interceptor: No active stories found for '@{username}'."
+            )
+
+    try:
+        # Enforce 15-second execution timeout
+        return await asyncio.wait_for(_interceptor_task(), timeout=15.0)
+    except asyncio.TimeoutError:
+        logger.error(
+            "fetch_stories_via_playwright_interceptor: timed out (15s limit) for username=%r",
+            username,
+        )
+        raise TikTokBlockedError(
+            f"Playwright interceptor timed out after 15 seconds for user '@{username}'."
+        )
+    except (StoriesNotFoundError, TikTokBlockedError):
+        raise
+    except Exception as exc:
+        logger.exception(
+            "fetch_stories_via_playwright_interceptor failed for username=%r", username
+        )
+        raise TikTokBlockedError(
+            f"Playwright interceptor failed for user '@{username}': {exc}"
+        ) from exc
+
+
 # ── Story fetcher ─────────────────────────────────────────────────────────────
 
 async def fetch_stories_for_user(username: str) -> dict:
     """
-    Full pipeline: resolve ``author_id`` → fetch and paginate the story API.
-
-    Opens a single ``httpx.AsyncClient`` and reuses it for both the user-detail
-    call and all story-API pages (connection pooling, shared TLS session).
-
-    Endpoint::
-
-        GET /api/story/item_list/?author_id={author_id}&count=30
-                                  &cursor={cursor}&aid=1988
+    Full pipeline:
+      Level 1 — Direct REST HTTP calls (httpx)
+      Level 2 — Stealth Playwright XHR interceptor fallback
 
     Args:
         username: TikTok username without the leading ``@``.
 
     Returns:
-        A merged dict shaped like a single TikTok ``/api/story/item_list/``
-        response, with ``itemList`` containing **all** accumulated stories::
-
-            {
-                "itemList": [ { ... }, ... ],   # all stories, all pages
-                "status_code": 0,               # from last API page envelope
-                ...                             # other TikTok envelope fields
-            }
+        A merged dict with ``itemList`` containing all accumulated stories.
 
     Raises:
-        UserNotFoundError:    User does not exist or author_id cannot be resolved.
+        UserNotFoundError:    User does not exist.
         StoriesNotFoundError: User exists but has no active stories.
-        TikTokBlockedError:   TikTok rate-limited or blocked the request.
+        TikTokBlockedError:   TikTok rate-limited or blocked both levels.
     """
-    async with _make_client() as client:
-        # ── Step 1: resolve author_id ─────────────────────────────────────────
-        author_id, _ = await resolve_user_credentials(username, client)
-
-        # ── Step 2: paginate the story API ────────────────────────────────────
-        story_url    = f"{TIKTOK_BASE}{_STORY_API_PATH}"
-        referer      = f"{TIKTOK_BASE}/@{username}"
-        story_headers = {**_BASE_API_HEADERS, "Referer": referer}
-
-        all_items: list[dict] = []
-        envelope:  dict | None = None
-        cursor:    int | str = 0
-        has_more:  bool = True
-        page_num:  int  = 1
-
-        while has_more:
-            params: dict[str, str] = {
-                "author_id": author_id,
-                "count":     "30",
-                "cursor":    str(cursor),
-                "aid":       _AID,
-            }
-
-            logger.info(
-                "fetch_stories_for_user: page %d  cursor=%s  username=%r",
-                page_num, cursor, username,
+    # ── Level 1: Direct HTTP calls (httpx) ──────────────────────────────────
+    try:
+        async with _make_client() as client:
+            author_id, sec_uid = await resolve_user_credentials(username, client)
+            result = await fetch_tiktok_stories_direct(
+                author_id, sec_uid=sec_uid, username=username
             )
-
-            try:
-                resp = await client.get(
-                    story_url, params=params, headers=story_headers
-                )
-            except httpx.RequestError as exc:
-                raise TikTokBlockedError(
-                    f"fetch_stories_for_user: network error on page {page_num} "
-                    f"for '@{username}': {exc}"
-                ) from exc
-
-            logger.debug(
-                "fetch_stories_for_user: story API response  status=%d  page=%d",
-                resp.status_code, page_num,
-            )
-
-            # ── HTTP-level errors ─────────────────────────────────────────────
-            if resp.status_code in (403, 429):
-                raise TikTokBlockedError(
-                    f"TikTok blocked story API for '@{username}' "
-                    f"(HTTP {resp.status_code})."
-                )
-            if resp.status_code >= 500:
-                raise TikTokBlockedError(
-                    f"TikTok story API server error for '@{username}' "
-                    f"(HTTP {resp.status_code})."
-                )
-            if resp.status_code != 200:
-                raise TikTokBlockedError(
-                    f"Unexpected HTTP {resp.status_code} from story API "
-                    f"for '@{username}'."
-                )
-
-            # ── Parse JSON ────────────────────────────────────────────────────
-            try:
-                body: dict = resp.json()
-            except Exception as exc:
-                raise TikTokBlockedError(
-                    f"fetch_stories_for_user: non-JSON response on page "
-                    f"{page_num} for '@{username}': {exc}"
-                ) from exc
-
-            # ── TikTok internal status code ───────────────────────────────────
-            _check_tiktok_status(
-                body, f"fetch_stories_for_user('@{username}') page {page_num}"
-            )
-
-            # ── Accumulate items ──────────────────────────────────────────────
-            page_items: list[dict] = body.get("itemList") or []
-            all_items.extend(page_items)
-
-            # Update pagination state.
-            cursor   = body.get("cursor") or body.get("minCursor") or 0
-            has_more = bool(body.get("has_more") or body.get("hasMore"))
-
-            # Save envelope metadata (everything except itemList) so the final
-            # merged response looks like one complete API page.
-            envelope = {k: v for k, v in body.items() if k != "itemList"}
-
-            logger.info(
-                "fetch_stories_for_user: page %d done  "
-                "page_items=%d  cursor=%s  has_more=%s  total=%d",
-                page_num, len(page_items), cursor, has_more, len(all_items),
-            )
-
-            page_num += 1
-
-            # Safety guard: TikTok sometimes returns has_more=true with an empty
-            # itemList at the real end of the list.
-            if not page_items:
-                logger.info(
-                    "fetch_stories_for_user: empty page received — stopping pagination"
-                )
-                break
-
-        # ── Step 3: validate & merge ──────────────────────────────────────────
-        logger.info(
-            "fetch_stories_for_user: pagination complete  username=%r  total_items=%d",
-            username, len(all_items),
+            if result and result.get("itemList"):
+                return result
+    except UserNotFoundError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "fetch_stories_for_user: Level 1 httpx failed for '@%s': %s. "
+            "Falling back to Level 2 Playwright interceptor.",
+            username, exc,
         )
 
-        if not all_items:
-            raise StoriesNotFoundError(
-                f"User '@{username}' has no active stories."
-            )
-
-        merged: dict = {}
-        if envelope:
-            merged.update(envelope)
-        merged["itemList"] = all_items
-
-        return merged
+    # ── Level 2: Stealth Playwright Interceptor ─────────────────────────────
+    logger.info(
+        "fetch_stories_for_user: Triggering Level 2 Stealth Playwright Interceptor for '@%s'",
+        username,
+    )
+    return await fetch_stories_via_playwright_interceptor(username)
