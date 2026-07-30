@@ -24,6 +24,12 @@ from app.models import (
     RootResponse,
 )
 from app.scraper import fetch_page_info, download_story_media
+from app.tiktok_client import (
+    StoriesNotFoundError,
+    TikTokBlockedError,
+    UserNotFoundError,
+    fetch_tiktok_stories_direct,
+)
 from app.utils.parser import parse_story_response
 from app.utils.story_store import get_last_story_id, set_last_story_id
 
@@ -113,14 +119,14 @@ async def health() -> HealthResponse:
     response_model=ParsedStoriesResponse,
     summary="Fetch TikTok stories for a username",
     description=(
-        "Launches a headless Chromium browser via Playwright, navigates to the "
-        "TikTok profile page of the given **username**, and intercepts the "
-        "private Story API response (`/api/story/item_list/`). "
+        "Resolves the TikTok **username** to an internal ``secUid`` via a direct "
+        "HTTP request to TikTok's SSR page, then calls the private Story API "
+        "(`/api/story/item_list/`) directly — no browser automation required. "
         "The raw payload is cleaned and returned as structured JSON.\n\n"
         "**Authentication** — supply your API key via one of:\n"
         "- `X-API-Key: <your_key>` header\n"
         "- `Authorization: Bearer <your_key>` header\n\n"
-        "**Typical latency** — 10–20 seconds (browser cold-start + TikTok load time)."
+        "**Typical latency** — 1–3 seconds."
     ),
     tags=["Stories"],
     responses={
@@ -142,9 +148,32 @@ async def get_stories(
         min_length=1,
         max_length=64,
     ),
+    author_id: str | None = Query(
+        default=None,
+        description=(
+            "Optional: known numeric TikTok author_id (e.g. '6797910539677074437'). "
+            "When supplied, username resolution is skipped entirely and stories are "
+            "fetched directly — faster and immune to anti-bot challenges."
+        ),
+        examples=["6797910539677074437"],
+    ),
+    sec_uid: str | None = Query(
+        default=None,
+        description=(
+            "Optional: TikTok secUid for the user. "
+            "When supplied alongside author_id, it is appended to the story-API "
+            "request so TikTok can resolve the account without extra lookups."
+        ),
+    ),
 ) -> ParsedStoriesResponse:
     """
     Protected endpoint — fetches and parses TikTok stories for *username*.
+
+    If ``author_id`` is provided in the query string, the username-resolution
+    step is bypassed completely and stories are fetched directly from the
+    story API — this path is immune to profile-page anti-bot challenges.
+    ``sec_uid`` can optionally accompany ``author_id`` to further improve
+    the API success rate.
 
     Error conditions returned as structured JSON:
 
@@ -155,44 +184,65 @@ async def get_stories(
     | 502  | TikTok blocked the request or the browser failed |
     | 500  | Unexpected internal error |
     """
+    # ── Fast path: author_id supplied ─────────────────────────────────────
+    if author_id:
+        logger.info(
+            "get_stories: direct mode  username=%r  author_id=%s  sec_uid=%s",
+            username, author_id,
+            (sec_uid[:20] + "…") if sec_uid else "",
+        )
+        try:
+            story_json = await fetch_tiktok_stories_direct(
+                author_id, sec_uid=sec_uid or ""
+            )
+        except StoriesNotFoundError as exc:
+            logger.info("get_stories: no stories (direct)  author_id=%s", author_id)
+            raise HTTPException(
+                status_code=404,
+                detail={"success": False, "error": str(exc)},
+            ) from exc
+        except (TikTokBlockedError, UserNotFoundError) as exc:
+            logger.warning(
+                "get_stories: direct fetch failed  author_id=%s  error=%s", author_id, exc
+            )
+            raise HTTPException(
+                status_code=502,
+                detail={"success": False, "error": str(exc)},
+            ) from exc
+
+        parsed = parse_story_response(story_json)
+        # Zero stories from a graceful 400/403 response — return success with
+        # empty list so n8n workflows receive a structured 200 instead of a 404.
+        logger.info(
+            "get_stories: done (direct)  author_id=%s  story_count=%d",
+            author_id, parsed.get("story_count", 0),
+        )
+        return ParsedStoriesResponse(**parsed)
+
+    # ── Normal path: resolve via username ─────────────────────────────────────
     logger.info("get_stories: starting  username=%r", username)
 
     result = await fetch_page_info(username)
 
-    # ── Browser / Playwright failure ──────────────────────────────────────────
+    # ── Fetch failure (user not found, no stories, TikTok blocked) ──────────
     if not result.get("success"):
-        error_msg = result.get("error", "")
-        logger.error("get_stories: scraper failed  username=%r  error=%s", username, error_msg)
+        error_msg = result.get("error", "TikTok request failed.")
+        http_status: int = result.get("status_code", 502)
+        logger.error(
+            "get_stories: fetch failed  username=%r  status=%d  error=%s",
+            username,
+            http_status,
+            error_msg,
+        )
         raise HTTPException(
-            status_code=502,
-            detail={
-                "success": False,
-                "error": (
-                    "TikTok temporarily blocked the request. Try again in a few minutes."
-                    if not error_msg
-                    else f"Browser error: {error_msg}"
-                ),
-            },
+            status_code=http_status,
+            detail={"success": False, "error": error_msg},
         )
 
-    # fetch_page_info keeps the browser alive — close it now that we only need the JSON.
-    _browser = result.get("_browser")
-    _pw = result.get("_pw")
-    try:
-        if _browser:
-            await _browser.close()
-    except Exception:
-        pass
-    try:
-        if _pw:
-            await _pw.stop()
-    except Exception:
-        pass
-
-    # ── Story API was never intercepted ──────────────────────────────────────
+    # ── Safety guard: story_json should always be present on success ────────
     story_json: dict | None = result.get("story_json")
     if story_json is None:
-        logger.warning("get_stories: no story API response  username=%r", username)
+        logger.warning("get_stories: story_json missing despite success=True  username=%r", username)
         raise HTTPException(
             status_code=404,
             detail={
@@ -204,7 +254,7 @@ async def get_stories(
             },
         )
 
-    # ── Parse and return ──────────────────────────────────────────────────────
+    # ── Parse and return ────────────────────────────────────────────────
     parsed = parse_story_response(story_json)
 
     # Extra guard: if parser returned empty stories, surface a 404.
@@ -242,7 +292,7 @@ async def get_stories(
         "**Authentication** — supply your API key via one of:\n"
         "- `X-API-Key: <your_key>` header\n"
         "- `Authorization: Bearer <your_key>` header\n\n"
-        "**Typical latency** — 10–20 seconds (browser cold-start + TikTok load time)."
+        "**Typical latency** — 1–3 seconds."
     ),
     tags=["Stories"],
     responses={
@@ -288,49 +338,33 @@ async def get_latest_story(
     |------|-----------|
     | 401  | Missing or invalid API key |
     | 404  | No stories found / private account / user not found |
-    | 502  | TikTok blocked the request or the browser failed |
+    | 502  | TikTok blocked the request |
     | 500  | Unexpected internal error |
     """
     logger.info("get_latest_story: starting  username=%r", username)
 
     result = await fetch_page_info(username)
 
-    # ── Browser / Playwright failure ──────────────────────────────────────────
+
+    # ── Fetch failure (user not found, no stories, TikTok blocked) ───────────
     if not result.get("success"):
-        error_msg = result.get("error", "")
+        error_msg = result.get("error", "TikTok request failed.")
+        http_status: int = result.get("status_code", 502)
         logger.error(
-            "get_latest_story: scraper failed  username=%r  error=%s", username, error_msg
+            "get_latest_story: fetch failed  username=%r  status=%d  error=%s",
+            username,
+            http_status,
+            error_msg,
         )
         raise HTTPException(
-            status_code=502,
-            detail={
-                "success": False,
-                "error": (
-                    "TikTok temporarily blocked the request. Try again in a few minutes."
-                    if not error_msg
-                    else f"Browser error: {error_msg}"
-                ),
-            },
+            status_code=http_status,
+            detail={"success": False, "error": error_msg},
         )
 
-    # fetch_page_info keeps the browser alive — close it now that we only need the JSON.
-    _browser = result.get("_browser")
-    _pw = result.get("_pw")
-    try:
-        if _browser:
-            await _browser.close()
-    except Exception:
-        pass
-    try:
-        if _pw:
-            await _pw.stop()
-    except Exception:
-        pass
-
-    # ── Story API was never intercepted ──────────────────────────────────────
+    # ── Safety guard ──────────────────────────────────────────────────────────
     story_json: dict | None = result.get("story_json")
     if story_json is None:
-        logger.warning("get_latest_story: no story API response  username=%r", username)
+        logger.warning("get_latest_story: story_json missing despite success=True  username=%r", username)
         raise HTTPException(
             status_code=404,
             detail={"success": False, "error": "No active stories"},
@@ -425,16 +459,15 @@ _404_download = {
     summary="Download a single story (image or video)",
     description=(
         "Fetches all stories for *username*, locates the story whose ``id`` "
-        "matches *story_id*, downloads the raw media bytes through the same "
-        "Playwright browser session (so TikTok receives proper cookies and "
-        "headers), and streams the file directly to the caller.\n\n"
+        "matches *story_id*, downloads the raw media bytes via a direct httpx "
+        "request with browser-mimicking headers, and streams the file to the caller.\n\n"
         "- **Image stories** — returns the first image as ``image/jpeg``.\n"
         "- **Video stories** — downloads via ``download_url`` and returns as ``video/mp4``.\n\n"
         "TikTok CDN URLs are **never** exposed to the client.\n\n"
         "**Authentication** — same API key as ``/stories``:\n"
         "- `X-API-Key: <your_key>` header\n"
         "- `Authorization: Bearer <your_key>` header\n\n"
-        "**Typical latency** — 15–40 seconds (browser cold-start + page warm-up + download)."
+        "**Typical latency** — 3–10 seconds (story fetch + media download)."
     ),
     tags=["Stories"],
     responses={
@@ -481,52 +514,28 @@ async def download_story(
         "download_story: starting  username=%r  story_id=%r", username, story_id
     )
 
-    # ── Step 1: Fetch all stories — browser stays alive after this call ───────
+    # ── Step 1: Fetch all stories ─────────────────────────────────────────────
     result = await fetch_page_info(username)
 
-    # Grab the live browser objects before any early-return paths so we can
-    # clean them up on error.
-    _browser = result.get("_browser")
-    _context = result.get("_context")
-    _pw = result.get("_pw")
-
-    async def _close_browser() -> None:
-        """Best-effort cleanup of the live Playwright session."""
-        try:
-            if _browser:
-                await _browser.close()
-        except Exception:
-            pass
-        try:
-            if _pw:
-                await _pw.stop()
-        except Exception:
-            pass
-
     if not result.get("success"):
-        error_msg = result.get("error", "")
+        error_msg = result.get("error", "TikTok request failed.")
+        http_status: int = result.get("status_code", 502)
         logger.error(
-            "download_story: scraper failed  username=%r  error=%s", username, error_msg
+            "download_story: fetch failed  username=%r  status=%d  error=%s",
+            username,
+            http_status,
+            error_msg,
         )
-        await _close_browser()
         raise HTTPException(
-            status_code=502,
-            detail={
-                "success": False,
-                "error": (
-                    "TikTok temporarily blocked the request. Try again in a few minutes."
-                    if not error_msg
-                    else f"Browser error: {error_msg}"
-                ),
-            },
+            status_code=http_status,
+            detail={"success": False, "error": error_msg},
         )
 
     story_json: dict | None = result.get("story_json")
     if story_json is None:
         logger.warning(
-            "download_story: no story API response  username=%r", username
+            "download_story: story_json missing despite success=True  username=%r", username
         )
-        await _close_browser()
         raise HTTPException(
             status_code=404,
             detail={
@@ -545,7 +554,6 @@ async def download_story(
         logger.warning(
             "download_story: parser returned 0 stories  username=%r", username
         )
-        await _close_browser()
         raise HTTPException(
             status_code=404,
             detail={"success": False, "error": "No active stories found for this user."},
@@ -562,7 +570,6 @@ async def download_story(
             username,
             story_id,
         )
-        await _close_browser()
         raise HTTPException(
             status_code=404,
             detail={
@@ -577,7 +584,6 @@ async def download_story(
     if story_type == "image":
         images: list[str] = story.get("images") or []
         if not images:
-            await _close_browser()
             raise HTTPException(
                 status_code=404,
                 detail={"success": False, "error": "Image story has no image URLs."},
@@ -589,7 +595,6 @@ async def download_story(
         # Prefer download_url for videos (watermark-free on some accounts)
         media_url = story.get("download_url") or story.get("video_url") or ""
         if not media_url:
-            await _close_browser()
             raise HTTPException(
                 status_code=404,
                 detail={"success": False, "error": "Video story has no downloadable URL."},
@@ -604,21 +609,16 @@ async def download_story(
         media_url,
     )
 
-    # ── Step 4: Proxy-download via the EXISTING Playwright browser session ────
-    # Pass the live context / browser / pw so the download request inherits
-    # the exact same cookies and session tokens that fetched the story list.
-    # download_story_media closes the browser in its finally block.
+    # ── Step 4: Proxy-download via direct httpx stream ────────────────────────
+    # Uses browser-mimicking headers. No session cookies are available in the
+    # anonymous httpx context, so CDN 403s are possible on some video URLs.
     try:
         media_stream = download_story_media(
             media_url=media_url,
-            context=_context,
-            browser=_browser,
-            pw=_pw,
             username=username,
         )
     except Exception as exc:
         logger.exception("download_story: failed to initialise media stream")
-        await _close_browser()
         raise HTTPException(
             status_code=502,
             detail={"success": False, "error": f"Failed to start media download: {exc}"},

@@ -1,29 +1,40 @@
 """
-scraper.py - TikTok page loader using async Playwright / Chromium.
+scraper.py - Adapter shim: maps tiktok_client results to the legacy interface
+             expected by routes.py.
 
+<<<<<<< HEAD
 Phase 3: Network interception — records all API-related requests made while
 the TikTok profile page loads. Story scraping will be added in a later phase.
+=======
+The Playwright/Chromium browser automation has been fully removed. This module
+now delegates all TikTok I/O to tiktok_client.py (pure httpx) and returns the
+same dict shapes that routes.py has always consumed, so no route logic changes
+are required.
+
+Public surface (unchanged from the Playwright era):
+  • fetch_page_info(username)        → dict
+  • download_story_media(...)        → AsyncIterator[bytes]
+>>>>>>> 7b2fac5f8df204ddf37eed335f608958a43f6b34
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
-from pathlib import Path
 from typing import AsyncIterator
 
-from playwright.async_api import (
-    async_playwright,
-    Browser,
-    BrowserContext,
-    Error as PlaywrightError,
-    Request,
-    Response,
+import httpx
+
+from app.tiktok_client import (
+    TIKTOK_BASE,
+    StoriesNotFoundError,
+    TikTokBlockedError,
+    UserNotFoundError,
+    fetch_stories_for_user,
 )
 
 logger = logging.getLogger(__name__)
 
+<<<<<<< HEAD
 TIKTOK_BASE_URL = "https://www.tiktok.com"
 
 # Debug output directory — created automatically on first use.
@@ -36,12 +47,17 @@ DEBUG_SETTLE_SECONDS = 8
 NETWORK_KEYWORDS = ("api", "story", "stories", "feed", "post", "item", "aweme")
 
 _UA = (
+=======
+# User-Agent reused for media downloads.
+_DOWNLOAD_UA = (
+>>>>>>> 7b2fac5f8df204ddf37eed335f608958a43f6b34
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
 
+<<<<<<< HEAD
 def _is_api_url(url: str) -> bool:
     """Return True if *url* contains at least one of the tracked keywords."""
     lower = url.lower()
@@ -298,8 +314,62 @@ async def fetch_page_info(username: str) -> dict:
         logger.info(
             "fetch_page_info: pagination complete  total_items_from_tiktok=%d",
             len(_all_items),
-        )
+=======
+async def fetch_page_info(username: str) -> dict:
+    """
+    Resolve username → fetch all stories via direct httpx calls.
 
+    Adapts the tiktok_client result to the dict contract that routes.py expects:
+
+    Success::
+
+        {
+            "success": True,
+            "story_json": { "itemList": [...], ... },
+        }
+
+    Failure::
+
+        {
+            "success":     False,
+            "error":       "<human-readable message>",
+            "status_code": 404 | 502,   # routes use this to pick the right HTTP status
+        }
+
+    Note: No live browser objects are included.  Callers no longer need to
+    close a browser context after calling this function.
+
+    Args:
+        username: TikTok username without the leading ``@``.
+
+    Returns:
+        Always returns a dict — never raises.
+    """
+    logger.info("fetch_page_info: starting  username=%r", username)
+
+    try:
+        story_json = await fetch_stories_for_user(username)
+        logger.info(
+            "fetch_page_info: success  username=%r  items=%d",
+            username,
+            len(story_json.get("itemList") or []),
+        )
+        return {"success": True, "story_json": story_json}
+
+    except UserNotFoundError as exc:
+        logger.warning(
+            "fetch_page_info: user not found  username=%r — %s", username, exc
+        )
+        return {"success": False, "error": str(exc), "status_code": 404}
+
+    except StoriesNotFoundError as exc:
+        logger.info(
+            "fetch_page_info: no active stories  username=%r — %s", username, exc
+>>>>>>> 7b2fac5f8df204ddf37eed335f608958a43f6b34
+        )
+        return {"success": False, "error": str(exc), "status_code": 404}
+
+<<<<<<< HEAD
         # ── Build the merged story_json ───────────────────────────────────────
         # Combine the envelope (from last intercepted page) with all accumulated
         # items so the parser sees a single dict with the full itemList.
@@ -336,8 +406,18 @@ async def fetch_page_info(username: str) -> dict:
             current_url,
             html_length,
             len(network_log),
+=======
+    except TikTokBlockedError as exc:
+        # Preserve the exact error message raised by the resolver so that the
+        # "TikTok anti-bot active. Failed to resolve user profile." string
+        # (emitted when all 3 layers fail) reaches the n8n caller unchanged.
+        logger.warning(
+            "fetch_page_info: TikTok blocked  username=%r — %s", username, exc
+>>>>>>> 7b2fac5f8df204ddf37eed335f608958a43f6b34
         )
+        return {"success": False, "error": str(exc), "status_code": 502}
 
+<<<<<<< HEAD
         # ── Save debug artifacts ─────────────────────────────────────────────
         SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -406,97 +486,90 @@ async def fetch_page_info(username: str) -> dict:
             "network": [],
             "error": str(exc),
         }
+=======
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("fetch_page_info: unexpected error  username=%r", username)
+        return {"success": False, "error": str(exc), "status_code": 502}
+>>>>>>> 7b2fac5f8df204ddf37eed335f608958a43f6b34
 
 
 async def download_story_media(
     media_url: str,
-    context: BrowserContext,
-    browser: Browser,
-    pw,
     username: str,
     chunk_size: int = 65536,
 ) -> AsyncIterator[bytes]:
     """
-    Download TikTok media bytes through the **existing** Playwright
-    ``BrowserContext`` that was used to fetch the stories.
+    Stream TikTok media bytes to the caller via a direct httpx request.
 
-    By reusing the same context the download request inherits the session
-    cookies, browser fingerprint, and any JS-set tokens that TikTok's CDN
-    expects — avoiding the HTTP 403 that a fresh httpx / requests call
-    would receive.
-
-    Workflow
-    --------
-    1. Use the caller-supplied *context* (already warmed up by
-       ``fetch_page_info``) to make a ``context.request.get()`` call.
-    2. Yield the response body in *chunk_size* chunks so FastAPI's
-       ``StreamingResponse`` can forward them without buffering everything
-       in RAM.
-    3. Close the browser (and the Playwright instance) when done so we
-       don't leak browser processes.
+    Uses browser-mimicking headers (``Referer``, ``User-Agent``) to satisfy
+    TikTok's CDN.  Because no session cookies are available in the anonymous
+    httpx context, some CDN URLs may return HTTP 403 — this is a known
+    limitation of the cookie-free approach.  In that case the caller should
+    surface an error message instructing the consumer to use the raw URL
+    from the ``/stories`` JSON payload instead.
 
     Args:
-        media_url:  The internal TikTok CDN/playback URL to download.
-        context:    The live ``BrowserContext`` from ``fetch_page_info``.
-        browser:    The live ``Browser`` instance (will be closed after use).
-        pw:         The live ``Playwright`` instance (will be stopped after use).
-        username:   TikTok username — used only for the ``Referer`` header.
+        media_url:  Direct TikTok CDN URL to download.
+        username:   TikTok username — used to build the ``Referer`` header.
         chunk_size: Byte size of each yielded chunk (default 64 KiB).
 
     Yields:
         Raw ``bytes`` chunks of the media file.
 
     Raises:
-        RuntimeError: On any Playwright or HTTP-level failure.
+        RuntimeError: On HTTP failure or network error.
     """
-    profile_url = f"{TIKTOK_BASE_URL}/@{username}"
+    profile_url = f"{TIKTOK_BASE}/@{username}"
     logger.info(
-        "download_story_media: fetching via existing session  username=%r  media_url=%s",
+        "download_story_media: starting  username=%r  url=%s",
         username,
         media_url,
     )
 
     try:
-        api_request = context.request
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            http2=True,
+            follow_redirects=True,
+        ) as client:
+            async with client.stream(
+                "GET",
+                media_url,
+                headers={
+                    "User-Agent": _DOWNLOAD_UA,
+                    "Referer": profile_url,
+                    "Origin": TIKTOK_BASE,
+                    "Sec-Fetch-Dest": "video",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+            ) as response:
+                if response.status_code == 403:
+                    raise RuntimeError(
+                        "TikTok CDN returned HTTP 403. "
+                        "The URL may have expired or requires session cookies. "
+                        "Use the raw media URL from the /stories response directly."
+                    )
+                if not (200 <= response.status_code < 300):
+                    raise RuntimeError(
+                        f"TikTok CDN returned HTTP {response.status_code}."
+                    )
 
-        response = await api_request.get(
-            media_url,
-            headers={
-                "Referer": profile_url,
-                "Origin": TIKTOK_BASE_URL,
-            },
-        )
+                logger.info(
+                    "download_story_media: streaming  username=%r", username
+                )
+                async for chunk in response.aiter_bytes(chunk_size):
+                    yield chunk
 
-        if not response.ok:
-            raise RuntimeError(
-                f"TikTok CDN returned HTTP {response.status} for media URL."
-            )
-
-        body: bytes = await response.body()
-        logger.info("download_story_media: received %d bytes", len(body))
-
-        # Yield in chunks so callers can stream the response.
-        for offset in range(0, len(body), chunk_size):
-            yield body[offset : offset + chunk_size]
-
-    except PlaywrightError as exc:
-        logger.error("download_story_media: Playwright error — %s", exc)
-        raise RuntimeError(f"Browser error while downloading media: {exc}") from exc
     except RuntimeError:
         raise
+    except httpx.RequestError as exc:
+        logger.error("download_story_media: network error — %s", exc)
+        raise RuntimeError(
+            f"Network error while downloading media: {exc}"
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("download_story_media: unexpected error")
-        raise RuntimeError(f"Unexpected error while downloading media: {exc}") from exc
-    finally:
-        # Always release the browser resources after the stream is exhausted
-        # (or on error), regardless of whether the download succeeded.
-        try:
-            await browser.close()
-            logger.debug("download_story_media: browser closed")
-        except Exception:
-            pass
-        try:
-            await pw.stop()
-            logger.debug("download_story_media: playwright stopped")
-        except Exception:
-            pass
+        raise RuntimeError(
+            f"Unexpected error while downloading media: {exc}"
+        ) from exc
