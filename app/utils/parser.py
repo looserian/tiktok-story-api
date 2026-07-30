@@ -10,7 +10,25 @@ from __future__ import annotations
 
 import logging
 
+from typing import Any
+
 logger = logging.getLogger(__name__)
+
+
+def _extract_url(val: Any) -> str | None:
+    """
+    Extract a clean string URL from either a string or a TikTok URL object.
+
+    TikTok API payloads may represent URLs as plain strings or dict objects
+    containing a list of mirror URLs under ``urlList`` / ``url_list``.
+    """
+    if isinstance(val, str) and val:
+        return val
+    if isinstance(val, dict):
+        url_list = val.get("urlList") or val.get("url_list") or []
+        if url_list and isinstance(url_list[0], str) and url_list[0]:
+            return url_list[0]
+    return None
 
 
 def _extract_audio_url(item: dict) -> str | None:
@@ -32,31 +50,15 @@ def _extract_audio_url(item: dict) -> str | None:
     if not music:
         return None
 
-    # ── Path 1: music.playUrl is an object with urlList ───────────────────────
-    play_url_obj = music.get("playUrl")
-    if isinstance(play_url_obj, dict):
-        url_list: list[str] = play_url_obj.get("urlList") or play_url_obj.get("url_list") or []
-        if url_list and isinstance(url_list[0], str) and url_list[0]:
-            return url_list[0]
+    # ── Path 1: music.playUrl is an object or string ─────────────────────────
+    play_url = _extract_url(music.get("playUrl"))
+    if play_url:
+        return play_url
 
-    # ── Path 2: music.play_url (snake_case) is an object with url_list ────────
-    play_url_obj_snake = music.get("play_url")
-    if isinstance(play_url_obj_snake, dict):
-        url_list = (
-            play_url_obj_snake.get("url_list")
-            or play_url_obj_snake.get("urlList")
-            or []
-        )
-        if url_list and isinstance(url_list[0], str) and url_list[0]:
-            return url_list[0]
-
-    # ── Path 3: music.playUrl is a plain string (older API shape) ────────────
-    if isinstance(play_url_obj, str) and play_url_obj:
-        return play_url_obj
-
-    # ── Path 4: music.play_url is a plain string ──────────────────────────────
-    if isinstance(play_url_obj_snake, str) and play_url_obj_snake:
-        return play_url_obj_snake
+    # ── Path 2: music.play_url (snake_case) is an object or string ──────────
+    play_url_snake = _extract_url(music.get("play_url"))
+    if play_url_snake:
+        return play_url_snake
 
     return None
 
@@ -74,7 +76,12 @@ def parse_story_response(data: dict) -> dict:
         Never raises — missing fields are replaced with ``None`` / empty
         defaults so callers always receive a well-formed response.
     """
-    item_list: list[dict] = data.get("itemList") or []
+    item_list: list[dict] = (
+        data.get("itemList")
+        or data.get("items")
+        or data.get("aweme_list")
+        or []
+    )
 
     logger.info(
         "parse_story_response: raw itemList from TikTok  count=%d",
@@ -100,9 +107,9 @@ def parse_story_response(data: dict) -> dict:
 
         # Avatar — prefer the larger "avatarLarger" URL, fall back to "avatarMedium"
         avatar = (
-            author.get("avatarLarger")
-            or author.get("avatarMedium")
-            or author.get("avatarThumb")
+            _extract_url(author.get("avatarLarger"))
+            or _extract_url(author.get("avatarMedium"))
+            or _extract_url(author.get("avatarThumb"))
         )
 
         stats: dict = first_item.get("authorStats") or {}
@@ -115,7 +122,7 @@ def parse_story_response(data: dict) -> dict:
     stories: list[dict] = []
 
     for item in item_list:
-        item_id = item.get("id")
+        item_id = str(item.get("id")) if item.get("id") is not None else None
         create_time = item.get("createTime")
 
         # story.ExpiredAt may be nested under "story" key
@@ -131,11 +138,15 @@ def parse_story_response(data: dict) -> dict:
                 images: list[str] = []
                 for img in raw_images:
                     try:
-                        url_list: list[str] = (
-                            (img.get("imageURL") or {}).get("urlList") or []
+                        url_val = (
+                            img.get("imageURL")
+                            or img.get("display_image")
+                            or img.get("image_url")
+                            or img
                         )
-                        if url_list:
-                            images.append(url_list[0])
+                        extracted = _extract_url(url_val)
+                        if extracted:
+                            images.append(extracted)
                     except Exception as img_exc:  # noqa: BLE001
                         logger.warning(
                             "parse_story_response: skipping malformed image entry — %s",
@@ -170,9 +181,9 @@ def parse_story_response(data: dict) -> dict:
                         "type": "video",
                         "created_at": create_time,
                         "expires_at": expires_at,
-                        "video_url": video.get("playAddr"),
-                        "download_url": video.get("downloadAddr"),
-                        "cover": video.get("cover"),
+                        "video_url": _extract_url(video.get("playAddr") or video.get("play_addr")),
+                        "download_url": _extract_url(video.get("downloadAddr") or video.get("download_addr")),
+                        "cover": _extract_url(video.get("cover")),
                         "duration": video.get("duration"),
                         "views": item_stats.get("playCount"),
                         "likes": item_stats.get("diggCount"),

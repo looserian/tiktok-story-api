@@ -23,7 +23,7 @@ from app.models import (
     ParsedStoriesResponse,
     RootResponse,
 )
-from app.scraper import fetch_page_info, download_story_media
+from app.scraper import fetch_page_info, download_story_media, prepare_media_stream
 from app.tiktok_client import (
     StoriesNotFoundError,
     TikTokBlockedError,
@@ -211,6 +211,8 @@ async def get_stories(
             ) from exc
 
         parsed = parse_story_response(story_json)
+        if not parsed.get("username"):
+            parsed["username"] = username
         # Zero stories from a graceful 400/403 response — return success with
         # empty list so n8n workflows receive a structured 200 instead of a 404.
         logger.info(
@@ -613,7 +615,7 @@ async def download_story(
     # Uses browser-mimicking headers. No session cookies are available in the
     # anonymous httpx context, so CDN 403s are possible on some video URLs.
     try:
-        media_stream = download_story_media(
+        _, media_stream = await prepare_media_stream(
             media_url=media_url,
             username=username,
         )

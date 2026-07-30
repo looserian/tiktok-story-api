@@ -8,7 +8,7 @@ Pydantic-Settings handles validation and type coercion automatically.
 from __future__ import annotations
 
 from pydantic import field_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # ── Authentication ────────────────────────────────────────────────────────
     # Stored as a raw comma-separated string; use get_key_set() for lookups.
     api_keys: str = "changeme"
+    api_key: str | None = None
 
     # ── Application metadata ──────────────────────────────────────────────────
     app_name: str = "TikTok Story API"
@@ -33,6 +34,12 @@ class Settings(BaseSettings):
 
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = "INFO"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     @field_validator("api_keys", mode="before")
     @classmethod
@@ -47,11 +54,10 @@ class Settings(BaseSettings):
         Return a frozenset of all valid API keys, trimmed of whitespace.
         O(1) membership test; computed fresh each call (config is read-once).
         """
-        return frozenset(k.strip() for k in self.api_keys.split(",") if k.strip())
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+        keys = set(k.strip() for k in self.api_keys.split(",") if k.strip())
+        if self.api_key:
+            keys.update(k.strip() for k in self.api_key.split(",") if k.strip())
+        return frozenset(keys)
 
 
 # Singleton settings instance used across the entire application.
